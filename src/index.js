@@ -24,12 +24,26 @@ async function start() {
   console.log(`Check every: ${cfg.CHECK_INTERVAL_MS / 60000} min`);
   console.log(`Summary every: ${cfg.SUMMARY_INTERVAL_HOURS}h`);
 
-  await alerts.startupAlert();
+  // Fetch current stats immediately on startup and send as the opening digest
+  console.log('Fetching current validator stats...');
+  try {
+    const initialStats = await fetcher.fetchValidatorStats();
+    console.log(`[STARTUP] Rank: #${initialStats.rank} | Staked: ${initialStats.stakedTX.toFixed(0)} TX | Delegators: ${initialStats.delegators}`);
 
-  // Run first check immediately
-  await check();
+    // Send full gif digest as startup message — no previous snapshot yet
+    await alerts.summaryAlert(initialStats, null);
 
-  // Then schedule
+    // Seed state so first scheduled check has a baseline to diff against
+    lastStats       = { ...initialStats };
+    summarySnapshot = { ...initialStats };
+    lastSummaryTime = new Date();
+
+  } catch (e) {
+    console.error('[STARTUP] Failed to fetch initial stats:', e.message);
+    await alerts.offlineAlert(e.message);
+  }
+
+  // Schedule recurring checks
   setInterval(check, cfg.CHECK_INTERVAL_MS);
 }
 
