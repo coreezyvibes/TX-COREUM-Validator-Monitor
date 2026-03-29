@@ -3,11 +3,6 @@
 const axios = require('axios');
 const cfg   = require('./config');
 
-/**
- * Fetches validator data.
- * Returns a normalised object regardless of source.
- * Throws if all sources fail.
- */
 async function fetchValidatorStats() {
 
   // ── Try indexer first (only if INDEXER_API_URL is configured) ────────────
@@ -35,11 +30,9 @@ async function fetchValidatorStats() {
     console.log('[FETCHER] No INDEXER_API_URL configured — using public LCD');
   }
 
-  // ── Fall back to public LCD ───────────────────────────────────────────────
   return fetchFromLCD();
 }
 
-/** Normalise indexer API response → standard shape */
 function normaliseIndexer(d) {
   const stakedUcore    = parseFloat(d.tokens        || d.staked_tokens || 0);
   const delegators     = parseInt(d.delegator_count || d.delegators    || 0);
@@ -53,21 +46,13 @@ function normaliseIndexer(d) {
   const moniker        = d.moniker || d.description?.moniker || 'Unknown';
 
   return {
-    source:        'indexer',
-    moniker,
-    stakedTX:      stakedUcore / cfg.DENOM_DIVISOR,
-    delegators,
-    rank,
-    jailed,
-    status,
-    missedBlocks,
-    uptimePct,
-    commission,
-    votingPowerPct,
+    source: 'indexer',
+    moniker, stakedTX: stakedUcore / cfg.DENOM_DIVISOR,
+    delegators, rank, jailed, status,
+    missedBlocks, uptimePct, commission, votingPowerPct,
   };
 }
 
-/** Fetch directly from public LCD */
 async function fetchFromLCD() {
   // 1. Validator details
   const valResp = await axios.get(
@@ -88,30 +73,45 @@ async function fetchFromLCD() {
     rank = sorted.findIndex(v => v.operator_address === cfg.VALIDATOR_ADDRESS) + 1;
   } catch (_) {}
 
-  // 3. Delegator count
+  // 3. Delegator count — paginate through all pages and count
   let delegators = 0;
   try {
-    const delResp = await axios.get(
-      `${cfg.LCD_URL}/cosmos/staking/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/delegations?pagination.limit=1`,
-      { timeout: 8000 }
-    );
-    delegators = parseInt(delResp.data?.pagination?.total || 0);
-  } catch (_) {}
+    let nextKey = null;
+    let page = 0;
+    do {
+      const url = nextKey
+        ? `${cfg.LCD_URL}/cosmos/staking/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/delegations?pagination.limit=200&pagination.key=${encodeURIComponent(nextKey)}`
+        : `${cfg.LCD_URL}/cosmos/staking/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/delegations?pagination.limit=200`;
+
+      const delResp = await axios.get(url, { timeout: 10000 });
+      const entries = delResp.data?.delegation_responses || [];
+      delegators += entries.length;
+      nextKey = delResp.data?.pagination?.next_key || null;
+      page++;
+
+      // Safety cap — shouldn't need more than 10 pages at 200 each
+      if (page >= 10) break;
+    } while (nextKey);
+
+    console.log(`[FETCHER] Delegator count: ${delegators}`);
+  } catch (e) {
+    console.warn('[FETCHER] Delegator count failed:', e.message);
+  }
 
   const stakedUcore    = parseFloat(val.tokens || 0);
   const commissionRate = parseFloat(val.commission?.commission_rates?.rate || 0.05);
 
   return {
-    source:        'lcd',
-    moniker:       val.description?.moniker || 'Unknown',
-    stakedTX:      stakedUcore / cfg.DENOM_DIVISOR,
+    source:         'lcd',
+    moniker:        val.description?.moniker || 'Unknown',
+    stakedTX:       stakedUcore / cfg.DENOM_DIVISOR,
     delegators,
     rank,
-    jailed:        val.jailed === true,
-    status:        val.status,
-    missedBlocks:  -1,  // requires consensus address lookup — N/A in LCD mode
-    uptimePct:     -1,  // same
-    commission:    commissionRate * 100,
+    jailed:         val.jailed === true,
+    status:         val.status,
+    missedBlocks:   -1,
+    uptimePct:      -1,
+    commission:     commissionRate * 100,
     votingPowerPct: 0,
   };
 }

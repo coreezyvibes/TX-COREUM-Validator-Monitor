@@ -2,14 +2,50 @@
 
 const axios = require('axios');
 const cfg   = require('./config');
+const path  = require('path');
+const fs    = require('fs');
 
-// ── Sloth gif — hardcoded, always sent with the 4-hour digest ─────────────
-// Telegram sendAnimation accepts direct GIF URLs from media.giphy.com
-const SLOTH_GIF_URL = 'https://media.giphy.com/media/l0HlBO7eyXzSZkJri/giphy.gif';
+// ── Gif handling ───────────────────────────────────────────────────────────
+// On first use, the gif is uploaded to Telegram and the returned file_id is
+// cached in memory. Subsequent sends reuse the file_id (Telegram's CDN).
+// This avoids raw GitHub URL issues entirely.
+
+const GIF_PATH = path.join(__dirname, '..', 'assets', 'tenor Vibin.gif');
+let   cachedGifFileId = null;
+
+async function getGifFileId() {
+  if (cachedGifFileId) return cachedGifFileId;
+
+  try {
+    const FormData = require('form-data');
+    const form = new FormData();
+    form.append('chat_id', cfg.TELEGRAM_CHAT_ID);
+    form.append('animation', fs.createReadStream(GIF_PATH), {
+      filename: 'vibin.gif',
+      contentType: 'image/gif',
+    });
+
+    const resp = await axios.post(
+      `https://api.telegram.org/bot${cfg.TELEGRAM_BOT_TOKEN}/sendAnimation`,
+      form,
+      { headers: form.getHeaders(), timeout: 15000 }
+    );
+
+    cachedGifFileId = resp.data?.result?.animation?.file_id
+                   || resp.data?.result?.document?.file_id
+                   || null;
+
+    console.log('[GIF] Uploaded to Telegram, file_id cached');
+    return cachedGifFileId;
+
+  } catch (e) {
+    console.warn('[GIF] Upload failed:', e.message);
+    return null;
+  }
+}
 
 // ── Core send helpers ──────────────────────────────────────────────────────
 
-/** Send a plain text message */
 async function send(message) {
   try {
     await axios.post(
@@ -23,24 +59,27 @@ async function send(message) {
 }
 
 /**
- * Send a GIF with a caption (used for the 4-hour digest).
- * Falls back to plain sendMessage if animation fails.
+ * Send the digest with gif. On first call, uploads the gif and caches
+ * the Telegram file_id. All subsequent calls reuse it instantly.
+ * Falls back to plain text if gif fails.
  */
 async function sendWithGif(caption) {
   try {
-    await axios.post(
-      `https://api.telegram.org/bot${cfg.TELEGRAM_BOT_TOKEN}/sendAnimation`,
-      {
-        chat_id:    cfg.TELEGRAM_CHAT_ID,
-        animation:  SLOTH_GIF_URL,
-        caption,
-        parse_mode: 'HTML',
-      },
-      { timeout: 8000 }
-    );
+    const fileId = await getGifFileId();
+
+    if (fileId) {
+      // Reuse cached file_id — instant, no upload
+      await axios.post(
+        `https://api.telegram.org/bot${cfg.TELEGRAM_BOT_TOKEN}/sendAnimation`,
+        { chat_id: cfg.TELEGRAM_CHAT_ID, animation: fileId, caption, parse_mode: 'HTML' },
+        { timeout: 8000 }
+      );
+    } else {
+      // Gif unavailable — send text only
+      await send(caption);
+    }
   } catch (e) {
-    console.error('[TG] sendAnimation failed, falling back to text:', e.message);
-    // Fallback — send as plain message without gif
+    console.error('[TG] sendWithGif failed:', e.message);
     await send(caption);
   }
 }
@@ -88,7 +127,7 @@ function missedBlocksAlert(missed, previous) {
 }
 
 function rankChangeAlert(current, previous) {
-  const moved = previous - current; // positive = improved
+  const moved = previous - current;
   const emoji = moved > 0 ? '🟢' : '🔴';
   const dir   = moved > 0 ? `up ${moved}` : `down ${Math.abs(moved)}`;
   return send(
@@ -135,11 +174,11 @@ function votingPowerAlert(current, previous) {
   );
 }
 
-/** 4-hour digest — always sent with the sloth gif */
+/** 4-hour digest — always sent with the Coreezy sloth gif */
 function summaryAlert(stats, prev) {
   const stakedDelta = prev ? stats.stakedTX - prev.stakedTX : 0;
   const delDelta    = prev ? stats.delegators - prev.delegators : 0;
-  const rankDelta   = prev ? prev.rank - stats.rank : 0; // positive = improved
+  const rankDelta   = prev ? prev.rank - stats.rank : 0;
 
   const stakedArrow = stakedDelta > 0 ? '▲' : stakedDelta < 0 ? '▼' : '─';
   const delArrow    = delDelta    > 0 ? '▲' : delDelta    < 0 ? '▼' : '─';
@@ -172,7 +211,6 @@ function summaryAlert(stats, prev) {
 
     `Stake. Vibe. Grow. 🌴`;
 
-  // Always send with the sloth gif — not configurable
   return sendWithGif(caption);
 }
 
