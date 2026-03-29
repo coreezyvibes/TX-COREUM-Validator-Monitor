@@ -13,7 +13,7 @@ Checks your validator every 10 minutes and fires Telegram alerts for:
 | Alert | Trigger |
 |---|---|
 | 🚨 Validator Jailed | Detected jailed status |
-| 🔴 Validator Unreachable | Both indexer and LCD failed |
+| 🔴 Validator Unreachable | All LCD endpoints failed |
 | ⚠️ Uptime Drop | Falls below your threshold (requires indexer) |
 | ⚠️ Missed Blocks | Counter jumps by 10+ in one check (requires indexer) |
 | 🟢/🔴 Rank Changed | Any position change |
@@ -21,7 +21,9 @@ Checks your validator every 10 minutes and fires Telegram alerts for:
 | 🟢/🔴 Delegator Count | Any change — up or down |
 | 🟢/🔴 Voting Power | Moves by 5%+ (requires indexer) |
 
-Plus a **4-hour digest** — sent with a 🦥 sloth gif — showing all stats with deltas vs the previous summary: rank, staked TX, delegators, uptime, missed blocks, commission — all with ▲/▼ indicators.
+Plus a **4-hour digest** sent with the Coreezy sloth gif — showing all stats with ▲/▼ deltas vs the previous report: rank, staked TX, delegators, uptime, missed blocks, commission.
+
+On startup the bot immediately fetches current stats and sends the first digest so you know it's working right away.
 
 ---
 
@@ -29,31 +31,35 @@ Plus a **4-hour digest** — sent with a 🦥 sloth gif — showing all stats wi
 
 - Node.js 18+
 - A TX/Coreum validator operator address
-- A Telegram account
-- Access to the **COREZ Buy Bot** on Telegram (free — details below)
+- A Telegram bot token and chat ID (see Step 1 below)
 
-No blockchain node required — works out of the box with the public LCD.
+No blockchain node required — works out of the box using public LCD nodes with automatic fallback.
 
 ---
 
-## Step 1 — Get Telegram Set Up via COREZ Buy Bot
+## Step 1 — Create Your Telegram Bot
 
-This monitor sends alerts through the **COREZ Buy Bot**. Here's how to get your credentials:
+This monitor requires a Telegram bot to send you alerts. You need to create your own — it takes about 2 minutes.
 
-### 1a. Find the COREZ Buy Bot
-Search for **@CoreezyVibesBot** on Telegram (or find it pinned in the [Coreezy Telegram](https://t.me/CoreezyVibes)).
+### 1a. Create a bot with BotFather
 
-### 1b. Get your Bot Token
-The COREZ Buy Bot is a shared community bot. To use it for your own alerts:
+1. Open Telegram and search for **@BotFather**
+2. Send `/newbot`
+3. Choose a name (e.g. `My Validator Monitor`)
+4. Choose a username ending in `bot` (e.g. `myvalidator_monitor_bot`)
+5. BotFather replies with your **bot token** — looks like `123456789:ABCdef...`
+6. Copy it — this is your `TELEGRAM_BOT_TOKEN`
 
-1. Message the bot: `/start`
-2. The bot will reply with instructions to register your validator address
-3. You'll receive a personal `bot_token` and `chat_id` to use as your env vars
+### 1b. Get your Chat ID
 
-> **Note:** Each validator gets its own isolated alert stream — your alerts only go to you.
+1. Search for your new bot in Telegram and send it `/start`
+2. Then open this URL in your browser (replace `YOUR_BOT_TOKEN`):
+   ```
+   https://api.telegram.org/botYOUR_BOT_TOKEN/getUpdates
+   ```
+3. Find `"chat":{"id":` in the response — that number is your `TELEGRAM_CHAT_ID`
 
-### 1c. Find your Telegram Chat ID
-After starting the bot, send `/myid` — it will reply with your numeric chat ID.
+> **Tip:** If the response is empty, send another message to your bot first then refresh.
 
 ---
 
@@ -66,7 +72,8 @@ After starting the bot, send `/myid` — it will reply with your numeric chat ID
 3. Select your fork
 4. Go to **Variables** and add the env vars from Step 3
 5. Set the **Start Command** to: `node src/index.js`
-6. Deploy — you'll get a startup Telegram message within seconds ✅
+6. Set the service to **Always On** (not a cron job)
+7. Deploy — you'll receive the first validator digest in Telegram within seconds ✅
 
 ### Option B: Run locally
 
@@ -81,7 +88,7 @@ node src/index.js
 
 ### Option C: Any VPS / cloud provider
 
-Works on any Node.js 18+ environment. Use `pm2` or `systemd` to keep it running:
+Works on any Node.js 18+ environment. Use `pm2` to keep it running:
 
 ```bash
 npm install -g pm2
@@ -100,8 +107,16 @@ Only 3 are required. Everything else has sensible defaults.
 | Variable | Description |
 |---|---|
 | `VALIDATOR_ADDRESS` | Your operator address (`corevaloper1...`) |
-| `TELEGRAM_BOT_TOKEN` | From the COREZ Buy Bot (Step 1b) |
-| `TELEGRAM_CHAT_ID` | Your numeric Telegram chat ID (Step 1c) |
+| `TELEGRAM_BOT_TOKEN` | From BotFather (Step 1a) |
+| `TELEGRAM_CHAT_ID` | Your numeric Telegram chat ID (Step 1b) |
+
+### Optional — Performance gif caching
+
+On first startup the bot uploads the Coreezy gif to Telegram and logs the `file_id`. To skip the upload on future restarts, add:
+
+| Variable | Description |
+|---|---|
+| `GIF_FILE_ID` | Telegram file_id logged on first startup — paste it here to cache permanently |
 
 ### Optional — Indexer API
 
@@ -112,61 +127,57 @@ For richer metrics (uptime %, missed blocks, voting power), point to a compatibl
 | `INDEXER_API_URL` | Base URL of your indexer (e.g. `https://your-indexer.railway.app`) |
 | `INDEXER_API_KEY` | API key if your indexer requires one |
 
-Without these, the monitor uses the **public LCD node** automatically — rank, staked TX, and delegator count still work perfectly.
-
-> Don't have an indexer? No problem — the monitor works fully out of the box using the public LCD node.
+> Don't have an indexer? No problem — the monitor works fully out of the box using public LCD nodes.
 
 ### Optional — Thresholds
 
 | Variable | Default | Description |
 |---|---|---|
 | `CHECK_INTERVAL_MS` | `600000` | How often to check (ms). 600000 = 10 min |
-| `SUMMARY_INTERVAL_HOURS` | `4` | How often to send the digest summary |
+| `SUMMARY_INTERVAL_HOURS` | `4` | How often to send the digest |
 | `UPTIME_ALERT_THRESHOLD` | `99.0` | Alert if uptime drops below this % |
 | `VOTING_POWER_CHANGE_PCT` | `5.0` | Alert if voting power moves by this % |
 | `STAKED_CHANGE_ALERT_TX` | `50000` | Alert if staked TX changes by this amount |
 | `MISSED_BLOCKS_ALERT` | `10` | Alert if missed blocks jumps by this per check |
 | `RANK_CHANGE_ALERT` | `1` | Min rank positions to trigger alert |
-| `LCD_URL` | publicnode | TX LCD endpoint (public, no account needed) |
+| `LCD_URL` | publicnode | Primary TX LCD endpoint — falls back automatically if unavailable |
 
 ---
 
 ## What the Alerts Look Like
 
-**Startup:**
-```
-🦥 TX/Coreum Validator Monitor Started
-Checking every 10 minutes
-Summary every 4 hours
-Watching: corevaloper1abc...
-```
+**On startup — immediate digest with gif:**
 
-**4-hour digest:**
+![Coreezy Validator Digest](assets/tenor%20Vibin.gif)
+
 ```
-🦥 Coreezy Validator — Sat, 28 Mar 2026 12:00:00 GMT
+🦥 Validator Report — Sun, 29 Mar 2026 00:42:56 GMT
 
 Status
 ✅ Online & Bonded
 
 Rank
-▲ #34 (+1 vs 4h ago)
+— #34
 
 Staked
-▲ 4,720,000 TX (+87,000)
+— 4.86M TX
 
 Delegators
-▲ 136 (+3)
+— 135
 
-Uptime
-99.997%
-
-Missed Blocks
-2
-
+Uptime  N/A
+Missed Blocks  N/A
 Commission  5.0%
-Data source indexer
 
 Stake. Vibe. Grow. 🌴
+```
+
+**Rank change alert:**
+```
+🟢 Rank Changed
+
+Now #33 (was #34)
+Moved up 1 position
 ```
 
 **Jail alert:**
@@ -175,7 +186,7 @@ Stake. Vibe. Grow. 🌴
 
 Your validator has been jailed.
 Status: BOND_STATUS_UNBONDING
-Staked: 4.72M TX
+Staked: 4.86M TX
 Rank: #34
 
 ⚡ Action required immediately!
@@ -185,12 +196,22 @@ Rank: #34
 
 ## Data Sources
 
-The monitor uses a two-tier approach:
+The monitor uses a three-tier approach with automatic fallback:
 
-1. **Indexer API** (optional) — richer data including uptime %, missed block counter, voting power. Configure via `INDEXER_API_URL`.
-2. **Public LCD** (automatic fallback) — always available, no setup needed. Provides rank, staked TX, delegator count, and jail status.
+1. **Indexer API** (optional) — richer data including uptime %, missed blocks, voting power
+2. **Primary LCD** — your configured `LCD_URL` (defaults to publicnode)
+3. **Official Coreum node** — `full-node.mainnet-1.coreum.dev`
+4. **Cosmos Directory proxy** — `rest.cosmos.directory/coreum`
 
-If the indexer fails for any reason, the monitor seamlessly falls back to LCD without interruption.
+If one source fails, the next is tried automatically. The monitor never goes dark due to a single node being down.
+
+> Uptime % and missed blocks require an indexer — they show as N/A in LCD-only mode. This will be unlocked in a future update.
+
+---
+
+## No Cron Required
+
+The check schedule is built into the bot — no external cron job needed. As long as your service is running (Railway always-on, pm2, systemd), it loops automatically every 10 minutes and sends the digest every 4 hours.
 
 ---
 
@@ -200,7 +221,7 @@ Coreezy is a validator and lifestyle brand on the TX Ecosystem. We build open-so
 
 - 🌐 [coreezy.xyz](https://coreezy.xyz)
 - 🐦 [@CoreezyVibes](https://twitter.com/CoreezyVibes)
-- 💬 [Telegram](https://t.me/CoreezyVibes)
+- 💬 [Telegram](https://t.me/HammockGang)
 - 🗳️ Validator: `corevaloper1uxengudkvpu5feqfqs4ant2hvukvf9ahxk63gh`
 
 **Stake with Coreezy** — 5% commission, 100% uptime, enterprise Zeeve infrastructure.
@@ -213,4 +234,4 @@ PRs welcome. If you add support for additional chains or indexers, open a PR and
 
 ---
 
-*MIT License*
+*Apache 2.0 License*
