@@ -5,44 +5,11 @@ const cfg   = require('./config');
 const path  = require('path');
 const fs    = require('fs');
 
-// ── Gif handling ───────────────────────────────────────────────────────────
-// On first use, the gif is uploaded to Telegram and the returned file_id is
-// cached in memory. Subsequent sends reuse the file_id (Telegram's CDN).
-// This avoids raw GitHub URL issues entirely.
-
 const GIF_PATH = path.join(__dirname, '..', 'assets', 'tenor Vibin.gif');
-let   cachedGifFileId = null;
 
-async function getGifFileId() {
-  if (cachedGifFileId) return cachedGifFileId;
-
-  try {
-    const FormData = require('form-data');
-    const form = new FormData();
-    form.append('chat_id', cfg.TELEGRAM_CHAT_ID);
-    form.append('animation', fs.createReadStream(GIF_PATH), {
-      filename: 'vibin.gif',
-      contentType: 'image/gif',
-    });
-
-    const resp = await axios.post(
-      `https://api.telegram.org/bot${cfg.TELEGRAM_BOT_TOKEN}/sendAnimation`,
-      form,
-      { headers: form.getHeaders(), timeout: 15000 }
-    );
-
-    cachedGifFileId = resp.data?.result?.animation?.file_id
-                   || resp.data?.result?.document?.file_id
-                   || null;
-
-    console.log('[GIF] Uploaded to Telegram, file_id cached');
-    return cachedGifFileId;
-
-  } catch (e) {
-    console.warn('[GIF] Upload failed:', e.message);
-    return null;
-  }
-}
+// Cached Telegram file_id after first upload
+// Once uploaded, Telegram hosts it — we just reuse the ID forever
+let cachedGifFileId = null;
 
 // ── Core send helpers ──────────────────────────────────────────────────────
 
@@ -59,27 +26,66 @@ async function send(message) {
 }
 
 /**
- * Send the digest with gif. On first call, uploads the gif and caches
- * the Telegram file_id. All subsequent calls reuse it instantly.
- * Falls back to plain text if gif fails.
+ * Send digest with gif.
+ *
+ * First call: uploads the gif file directly via sendAnimation (multipart).
+ *   → Telegram receives the file, displays the gif, returns a file_id.
+ *   → We cache that file_id for all future calls.
+ *
+ * Subsequent calls: sendAnimation with the cached file_id only.
+ *   → Telegram serves from their CDN instantly. No upload, no double send.
+ *
+ * Falls back to plain text if gif fails entirely.
  */
 async function sendWithGif(caption) {
-  try {
-    const fileId = await getGifFileId();
+  // ── First time: upload the file directly WITH the caption in one shot ────
+  if (!cachedGifFileId) {
+    try {
+      const FormData = require('form-data');
+      const form = new FormData();
+      form.append('chat_id', cfg.TELEGRAM_CHAT_ID);
+      form.append('caption', caption);
+      form.append('parse_mode', 'HTML');
+      form.append('animation', fs.createReadStream(GIF_PATH), {
+        filename: 'vibin.gif',
+        contentType: 'image/gif',
+      });
 
-    if (fileId) {
-      // Reuse cached file_id — instant, no upload
-      await axios.post(
+      const resp = await axios.post(
         `https://api.telegram.org/bot${cfg.TELEGRAM_BOT_TOKEN}/sendAnimation`,
-        { chat_id: cfg.TELEGRAM_CHAT_ID, animation: fileId, caption, parse_mode: 'HTML' },
-        { timeout: 8000 }
+        form,
+        { headers: form.getHeaders(), timeout: 20000 }
       );
-    } else {
-      // Gif unavailable — send text only
+
+      // Cache the file_id Telegram assigned — use this for all future sends
+      cachedGifFileId = resp.data?.result?.animation?.file_id
+                     || resp.data?.result?.document?.file_id
+                     || null;
+
+      console.log('[GIF] First send complete. file_id cached:', cachedGifFileId);
+      return; // already sent with caption above — done
+
+    } catch (e) {
+      console.error('[GIF] Upload failed, falling back to text:', e.message);
       await send(caption);
+      return;
     }
+  }
+
+  // ── Subsequent times: reuse cached file_id ────────────────────────────────
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${cfg.TELEGRAM_BOT_TOKEN}/sendAnimation`,
+      {
+        chat_id:    cfg.TELEGRAM_CHAT_ID,
+        animation:  cachedGifFileId,
+        caption,
+        parse_mode: 'HTML',
+      },
+      { timeout: 8000 }
+    );
   } catch (e) {
-    console.error('[TG] sendWithGif failed:', e.message);
+    console.error('[GIF] Send with file_id failed, falling back to text:', e.message);
     await send(caption);
   }
 }
@@ -223,8 +229,6 @@ function startupAlert() {
   );
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
 function fmt(n) {
   const abs = Math.abs(n);
   if (abs >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
@@ -233,14 +237,7 @@ function fmt(n) {
 }
 
 module.exports = {
-  jailAlert,
-  offlineAlert,
-  uptimeAlert,
-  missedBlocksAlert,
-  rankChangeAlert,
-  stakedChangeAlert,
-  delegatorChangeAlert,
-  votingPowerAlert,
-  summaryAlert,
-  startupAlert,
+  jailAlert, offlineAlert, uptimeAlert, missedBlocksAlert,
+  rankChangeAlert, stakedChangeAlert, delegatorChangeAlert,
+  votingPowerAlert, summaryAlert, startupAlert,
 };
