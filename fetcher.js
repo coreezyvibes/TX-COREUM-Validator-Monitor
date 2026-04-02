@@ -1,13 +1,12 @@
 // fetcher.js — tries indexer API first (if configured), falls back to LCD
 // Uses multiple LCD endpoints with automatic fallback
-// LCD path now derives consensus address and fetches real uptime % + missed blocks
+// LCD path derives consensus address and fetches real uptime % + missed blocks
 
 const axios  = require('axios');
 const cfg    = require('./config');
 const crypto = require('crypto');
 
 // ── Bech32 utility (no external deps) ─────────────────────────────────────
-// Used to convert the validator's ed25519/secp256k1 pubkey → corevalcons1... address
 
 const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
 
@@ -30,13 +29,6 @@ function bech32HrpExpand(hrp) {
   return ret;
 }
 
-function bech32Encode(hrp, data) {
-  const combined = [...data, 0, 0, 0, 0, 0, 0];
-  const mod = bech32Polymod([...bech32HrpExpand(hrp), ...combined]) ^ 1;
-  for (let i = 0; i < 6; i++) combined[data.length + i] = (mod >> (5 * (5 - i))) & 31;
-  return hrp + '1' + combined.map(d => BECH32_CHARSET[d]).join('');
-}
-
 function convertBits(data, fromBits, toBits, pad = true) {
   let acc = 0, bits = 0;
   const result = [];
@@ -53,19 +45,36 @@ function convertBits(data, fromBits, toBits, pad = true) {
   return result;
 }
 
+function bech32Encode(hrp, words) {
+  // Build checksum separately so we don't mutate the words array
+  const checksumInput = [...bech32HrpExpand(hrp), ...words, 0, 0, 0, 0, 0, 0];
+  const mod = bech32Polymod(checksumInput) ^ 1;
+  const checksum = [];
+  for (let i = 0; i < 6; i++) checksum.push((mod >> (5 * (5 - i))) & 31);
+  return hrp + '1' + [...words, ...checksum].map(d => BECH32_CHARSET[d]).join('');
+}
+
 /**
- * Derive corevalcons1... address from the consensus pubkey returned by LCD.
- * The LCD returns consensus_pubkey as { '@type': '...Ed25519...', key: '<base64>' }
- * We SHA256 the raw 32-byte pubkey and take the first 20 bytes → bech32 encode.
+ * Derive corevalcons1... from the consensus_pubkey returned by the LCD.
+ * Cosmos SDK ed25519 consensus address = SHA256(raw_32_byte_pubkey)[0:20]
  */
 function pubkeyToConsAddress(consensusPubkey) {
-  // key is base64-encoded 32-byte ed25519 public key
-  const keyBytes = Buffer.from(consensusPubkey.key, 'base64');
-  // Cosmos uses SHA256(pubkey)[0:20] as the address bytes
-  const hash = crypto.createHash('sha256').update(keyBytes).digest();
-  const addressBytes = hash.slice(0, 20);
-  const words = convertBits(Array.from(addressBytes), 8, 5);
-  return bech32Encode('corevalcons', words);
+  if (!consensusPubkey || !consensusPubkey.key) {
+    throw new Error(`consensus_pubkey missing or has no key field: ${JSON.stringify(consensusPubkey)}`);
+  }
+
+  const keyBase64 = consensusPubkey.key;
+  const keyBytes  = Buffer.from(keyBase64, 'base64');
+  console.log(`[FETCHER] consensus_pubkey type: ${consensusPubkey['@type']}`);
+  console.log(`[FETCHER] pubkey base64: ${keyBase64} (${keyBytes.length} bytes)`);
+
+  const hash      = crypto.createHash('sha256').update(keyBytes).digest();
+  const addrBytes = hash.slice(0, 20);
+  console.log(`[FETCHER] address bytes (hex): ${addrBytes.toString('hex')}`);
+
+  const words       = convertBits(Array.from(addrBytes), 8, 5);
+  const consAddress = bech32Encode('corevalcons', words);
+  return consAddress;
 }
 
 // ── LCD endpoints ──────────────────────────────────────────────────────────
@@ -96,7 +105,7 @@ async function lcdGet(path) {
 
 async function fetchValidatorStats() {
 
-  // ── Try indexer first (only if INDEXER_API_URL is configured) ────────────
+  // Try indexer first (only if INDEXER_API_URL is configured)
   if (cfg.INDEXER_API_URL) {
     try {
       const headers = cfg.INDEXER_API_KEY
@@ -196,9 +205,8 @@ async function fetchFromLCD() {
   }
 
   // 4. Missed blocks + uptime via slashing signing_info
-  //    Derive corevalcons1... from the validator's consensus pubkey automatically
-  let missedBlocks   = -1;
-  let uptimePct      = -1;
+  let missedBlocks = -1;
+  let uptimePct    = -1;
 
   try {
     const consAddress = pubkeyToConsAddress(val.consensus_pubkey);
@@ -208,22 +216,25 @@ async function fetchFromLCD() {
       `/cosmos/slashing/v1beta1/signing_infos/${consAddress}`
     );
     const info = signingResp.data?.val_signing_info;
+    console.log(`[FETCHER] Signing info raw:`, JSON.stringify(info));
 
     if (info) {
       missedBlocks = parseInt(info.missed_blocks_counter || 0);
       console.log(`[FETCHER] Missed blocks: ${missedBlocks}`);
 
-      // Fetch slashing params to get the signing window size
       try {
         const paramsResp = await lcdGet(`/cosmos/slashing/v1beta1/params`);
         const windowSize = parseInt(paramsResp.data?.params?.signed_blocks_window || 0);
+        console.log(`[FETCHER] Signing window: ${windowSize}`);
         if (windowSize > 0) {
           uptimePct = ((windowSize - missedBlocks) / windowSize) * 100;
-          console.log(`[FETCHER] Uptime: ${uptimePct.toFixed(3)}% (window: ${windowSize})`);
+          console.log(`[FETCHER] Uptime: ${uptimePct.toFixed(3)}%`);
         }
       } catch (e) {
         console.warn('[FETCHER] Slashing params fetch failed:', e.message);
       }
+    } else {
+      console.warn('[FETCHER] val_signing_info was empty in response');
     }
   } catch (e) {
     console.warn('[FETCHER] Signing info fetch failed:', e.message);
