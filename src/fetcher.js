@@ -2,9 +2,10 @@
 // Uses multiple LCD endpoints with automatic fallback
 // LCD path derives consensus address and fetches real uptime % + missed blocks + APR + price
 
-const axios  = require('axios');
-const cfg    = require('./config');
-const crypto = require('crypto');
+const axios          = require('axios');
+const cfg            = require('./config');
+const crypto         = require('crypto');
+const rewardsTracker = require('./rewardsTracker');
 
 // ── Bech32 utility (no external deps) ─────────────────────────────────────
 
@@ -139,10 +140,11 @@ function normaliseIndexer(d) {
     delegators, rank, jailed, status, missedBlocks, uptimePct, commission, votingPowerPct,
     slashFractionDoubleSign: 0,
     slashFractionDowntime:   0,
-    aprGross:       -1,
-    aprDelegator:   -1,
-    inflationRate:  -1,
-    txPriceUsd:     -1,
+    aprGross:          -1,
+    aprDelegator:      -1,
+    aprSource:         'projection',
+    inflationRate:     -1,
+    txPriceUsd:        -1,
     monthlyRevenueUsd: -1,
   };
 }
@@ -165,16 +167,10 @@ async function fetchTxPrice() {
   }
 }
 
-// ── APR + inflation calculation ───────────────────────────────────────────
-//
-// Coreum uses a variable inflation model — the mint module's annual_provisions
-// reflects the actual tokens to be minted this year, which is the correct
-// basis for APR (not the raw inflation rate fraction).
-//
-// APR    = annual_provisions × (1 - community_tax) / bonded_tokens
-// inflation_rate is fetched separately and shown for informational purposes.
+// ── Projection APR (fallback) ─────────────────────────────────────────────
+// Used until rewardsTracker has enough real data points.
 
-async function fetchAPRAndInflation(commissionRate) {
+async function fetchProjectionAPR(commissionRate) {
   try {
     const [provisionsResp, inflationResp, distResp, poolResp] = await Promise.all([
       lcdGet('/cosmos/mint/v1beta1/annual_provisions'),
@@ -190,27 +186,51 @@ async function fetchAPRAndInflation(commissionRate) {
 
     if (bondedTokens === 0) throw new Error('bondedTokens is zero');
 
-    const stakerProvisions = annualProvisions * (1 - communityTax);
-    const aprGross         = stakerProvisions / bondedTokens;
-    const aprDelegator     = aprGross * (1 - commissionRate);
+    const aprGross     = (annualProvisions * (1 - communityTax)) / bondedTokens * 100;
+    const aprDelegator = aprGross * (1 - commissionRate);
 
     console.log(
-      `[FETCHER] APR — annual_provisions: ${(annualProvisions / 1e6).toFixed(0)} TX` +
-      ` | inflation: ${(inflationRate * 100).toFixed(4)}%` +
-      ` | community_tax: ${(communityTax * 100).toFixed(2)}%` +
-      ` | bonded: ${(bondedTokens / 1e6).toFixed(0)} TX` +
-      ` | gross APR: ${(aprGross * 100).toFixed(2)}%` +
-      ` | delegator APR: ${(aprDelegator * 100).toFixed(2)}%`
+      `[FETCHER] Projection APR — provisions: ${(annualProvisions/1e6).toFixed(0)} TX` +
+      ` | inflation: ${(inflationRate*100).toFixed(4)}%` +
+      ` | gross: ${aprGross.toFixed(2)}%`
     );
 
-    return {
-      aprGross:      aprGross * 100,
-      aprDelegator:  aprDelegator * 100,
-      inflationRate: inflationRate * 100,
-    };
+    return { aprGross, aprDelegator, inflationRate: inflationRate * 100 };
   } catch (e) {
-    console.warn('[FETCHER] APR calculation failed:', e.message);
+    console.warn('[FETCHER] Projection APR failed:', e.message);
     return { aprGross: -1, aprDelegator: -1, inflationRate: -1 };
+  }
+}
+
+// ── Fetch cumulative validator rewards for real APR tracking ──────────────
+//
+// /cosmos/distribution/v1beta1/validators/{addr}/outstanding_rewards
+// returns the current undistributed rewards sitting in the validator's pool.
+// This grows monotonically each block, so diffing two readings gives us
+// the actual earn rate over that period.
+
+async function fetchAndRecordRewards(stakedUcore, commissionRate, projectionAPR) {
+  try {
+    const resp = await lcdGet(
+      `/cosmos/distribution/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/outstanding_rewards`
+    );
+    const rewards = resp.data?.rewards?.rewards || [];
+    const ucoreReward = rewards.find(r => r.denom === 'ucore' || r.denom === 'utcore');
+    const amountUcore = ucoreReward ? parseFloat(ucoreReward.amount) : 0;
+
+    // Record this snapshot for rolling APR calculation
+    rewardsTracker.recordSnapshot(amountUcore);
+
+    // Calculate APR from real data (falls back to projection if not enough data yet)
+    return rewardsTracker.calculateAPR(stakedUcore, commissionRate, projectionAPR);
+
+  } catch (e) {
+    console.warn('[FETCHER] Outstanding rewards fetch failed:', e.message);
+    return {
+      aprGross:     projectionAPR,
+      aprDelegator: projectionAPR >= 0 ? projectionAPR * (1 - commissionRate) : -1,
+      source:       'projection',
+    };
   }
 }
 
@@ -319,23 +339,35 @@ async function fetchFromLCD() {
     console.warn(`[FETCHER] Signing info fetch failed: ${e.message}`);
   }
 
-  // 5. APR, inflation rate, and TX price — fetched in parallel
-  const commissionRate = parseFloat(val.commission?.commission_rates?.rate || 0.05);
-  const stakedUcore    = parseFloat(val.tokens || 0);
-  const stakedTX       = stakedUcore / cfg.DENOM_DIVISOR;
+  // 5. APR and inflation — run projection and real tracker in sequence
+  //    (projection runs first to provide the fallback value to the tracker)
+  const commissionRate  = parseFloat(val.commission?.commission_rates?.rate || 0.05);
+  const stakedUcore     = parseFloat(val.tokens || 0);
+  const stakedTX        = stakedUcore / cfg.DENOM_DIVISOR;
 
-  const [{ aprGross, aprDelegator, inflationRate }, txPriceUsd] = await Promise.all([
-    fetchAPRAndInflation(commissionRate),
+  const [projectionResult, txPriceUsd] = await Promise.all([
+    fetchProjectionAPR(commissionRate),
     fetchTxPrice(),
   ]);
 
-  // Monthly revenue = validator's commission share of annual staking rewards / 12
-  // = staked_TX × gross_APR × commission_rate / 12 × price
+  const { inflationRate } = projectionResult;
+
+  // Real APR from accumulated rewards (uses projection as fallback)
+  const {
+    aprGross,
+    aprDelegator,
+    source: aprSource,
+  } = await fetchAndRecordRewards(stakedUcore, commissionRate, projectionResult.aprGross);
+
+  // Monthly revenue = validator's annual commission earnings / 12 × price
   let monthlyRevenueUsd = -1;
   if (aprGross >= 0 && txPriceUsd > 0) {
-    const annualRevenueTX  = stakedTX * (aprGross / 100) * commissionRate;
-    monthlyRevenueUsd      = (annualRevenueTX / 12) * txPriceUsd;
-    console.log(`[FETCHER] Monthly revenue: $${monthlyRevenueUsd.toFixed(2)} (${annualRevenueTX.toFixed(0)} TX/yr @ $${txPriceUsd})`);
+    const annualRevenueTX = stakedTX * (aprGross / 100) * commissionRate;
+    monthlyRevenueUsd     = (annualRevenueTX / 12) * txPriceUsd;
+    console.log(
+      `[FETCHER] Monthly revenue: $${monthlyRevenueUsd.toFixed(2)}` +
+      ` (${annualRevenueTX.toFixed(0)} TX/yr @ $${txPriceUsd}) [${aprSource}]`
+    );
   }
 
   return {
@@ -354,6 +386,7 @@ async function fetchFromLCD() {
     slashFractionDowntime,
     aprGross,
     aprDelegator,
+    aprSource,
     inflationRate,
     txPriceUsd,
     monthlyRevenueUsd,

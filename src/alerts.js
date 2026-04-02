@@ -7,8 +7,28 @@ const fs    = require('fs');
 
 const GIF_PATH = path.join(__dirname, '..', 'assets', 'tenor Vibin.gif');
 
-// Cached Telegram file_id after first upload
 let cachedGifFileId = process.env.GIF_FILE_ID || null;
+
+// ── Time formatting ────────────────────────────────────────────────────────
+
+/**
+ * Format a date in Eastern Time (ET).
+ * Automatically handles EST (UTC-5) and EDT (UTC-4) transitions.
+ * Example output: "Thu, Apr 02 2026, 5:03 PM ET"
+ */
+function formatET(date) {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone:     'America/New_York',
+    weekday:      'short',
+    month:        'short',
+    day:          '2-digit',
+    year:         'numeric',
+    hour:         'numeric',
+    minute:       '2-digit',
+    hour12:       true,
+    timeZoneName: 'short',
+  }).format(date);
+}
 
 // ── Core send helpers ──────────────────────────────────────────────────────
 
@@ -193,23 +213,23 @@ function summaryAlert(stats, prev) {
   const delArrow    = delDelta    > 0 ? '▲' : delDelta    < 0 ? '▼' : '─';
   const rankArrow   = rankDelta   > 0 ? '▲' : rankDelta   < 0 ? '▼' : '─';
 
-  const uptimeStr   = stats.uptimePct    >= 0 ? `${stats.uptimePct.toFixed(3)}%`    : 'N/A';
-  const missedStr   = stats.missedBlocks >= 0 ? `${stats.missedBlocks}`             : 'N/A';
-  const aprGrossStr = stats.aprGross     >= 0 ? `${stats.aprGross.toFixed(2)}%`     : 'N/A';
-  const aprDelStr   = stats.aprDelegator >= 0 ? `${stats.aprDelegator.toFixed(2)}%` : 'N/A';
+  const uptimeStr   = stats.uptimePct     >= 0 ? `${stats.uptimePct.toFixed(3)}%`     : 'N/A';
+  const missedStr   = stats.missedBlocks  >= 0 ? `${stats.missedBlocks}`              : 'N/A';
+  const aprGrossStr = stats.aprGross      >= 0 ? `${stats.aprGross.toFixed(2)}%`      : 'N/A';
+  const aprDelStr   = stats.aprDelegator  >= 0 ? `${stats.aprDelegator.toFixed(2)}%`  : 'N/A';
   const inflStr     = stats.inflationRate >= 0 ? `${stats.inflationRate.toFixed(4)}%` : 'N/A';
-  const priceStr    = stats.txPriceUsd   > 0  ? `$${stats.txPriceUsd.toFixed(4)}`  : 'N/A';
+  const priceStr    = stats.txPriceUsd    >  0 ? `$${stats.txPriceUsd.toFixed(4)}`   : 'N/A';
   const revenueStr  = stats.monthlyRevenueUsd > 0
     ? `$${stats.monthlyRevenueUsd.toFixed(2)}`
     : 'N/A';
 
-  // APR delta — only show if it shifted by 0.01% or more
+  const aprLabel    = stats.aprSource === 'projection' ? ' <i>(est.)</i>' : '';
   const aprDeltaStr = aprDelta !== null && Math.abs(aprDelta) >= 0.01
     ? ` (${aprDelta > 0 ? '+' : ''}${aprDelta.toFixed(2)}%)`
     : '';
 
   const caption =
-    `🦥 <b>Validator Report — ${new Date().toUTCString()}</b>\n\n` +
+    `🦥 <b>Validator Report — ${formatET(new Date())}</b>\n\n` +
 
     `<b>Status</b>\n` +
     `${stats.jailed ? '🚨 JAILED' : '✅ Online &amp; Bonded'}\n\n` +
@@ -230,7 +250,7 @@ function summaryAlert(stats, prev) {
     `<b>Missed Blocks</b>  ${missedStr}\n` +
     `<b>Commission</b>  ${stats.commission.toFixed(1)}%\n\n` +
 
-    `<b>Staking APR</b>\n` +
+    `<b>Staking APR</b>${aprLabel}\n` +
     `Gross:      ${aprGrossStr}\n` +
     `Delegator:  ${aprDelStr}${aprDeltaStr}\n` +
     `Inflation:  ${inflStr}\n\n` +
