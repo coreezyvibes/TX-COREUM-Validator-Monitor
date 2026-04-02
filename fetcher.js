@@ -53,16 +53,6 @@ function bech32Encode(hrp, words) {
   return hrp + '1' + [...words, ...checksum].map(d => BECH32_CHARSET[d]).join('');
 }
 
-/**
- * Derive corevalcons1... from the consensus_pubkey returned by the LCD.
- *
- * Cosmos SDK uses amino encoding before hashing for ed25519 keys:
- *   amino_prefix (4 bytes: 0x1624de64) + length (1 byte: 0x20) + raw_32_bytes
- * Then: SHA256(amino_encoded)[0:20] → bech32 encode as corevalcons
- *
- * We try amino-prefixed first (correct for most Cosmos chains),
- * then fall back to raw SHA256 in case the chain differs.
- */
 function pubkeyToConsAddress(consensusPubkey) {
   if (!consensusPubkey || !consensusPubkey.key) {
     throw new Error(`consensus_pubkey missing or has no key field: ${JSON.stringify(consensusPubkey)}`);
@@ -73,13 +63,13 @@ function pubkeyToConsAddress(consensusPubkey) {
   console.log(`[FETCHER] consensus_pubkey type: ${consensusPubkey['@type']}`);
   console.log(`[FETCHER] pubkey base64: ${keyBase64} (${keyBytes.length} bytes)`);
 
-  // Amino prefix for ed25519 public key: 0x1624de64 + length byte 0x20
-  const aminoPrefix = Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]);
+  // Amino prefix for ed25519: 0x1624de64 + length byte 0x20
+  const aminoPrefix  = Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]);
   const aminoEncoded = Buffer.concat([aminoPrefix, keyBytes]);
 
   const hash      = crypto.createHash('sha256').update(aminoEncoded).digest();
   const addrBytes = hash.slice(0, 20);
-  console.log(`[FETCHER] amino+sha256 address bytes (hex): ${addrBytes.toString('hex')}`);
+  console.log(`[FETCHER] address bytes (hex): ${addrBytes.toString('hex')}`);
 
   const words       = convertBits(Array.from(addrBytes), 8, 5);
   const consAddress = bech32Encode('corevalcons', words);
@@ -96,7 +86,6 @@ const LCD_ENDPOINTS = [
   'https://rest.cosmos.directory/coreum',
 ];
 
-/** Try each LCD endpoint in order, return first that works */
 async function lcdGet(path) {
   const errors = [];
   for (const base of LCD_ENDPOINTS) {
@@ -114,13 +103,9 @@ async function lcdGet(path) {
 // ── Main entry ─────────────────────────────────────────────────────────────
 
 async function fetchValidatorStats() {
-
-  // Try indexer first (only if INDEXER_API_URL is configured)
   if (cfg.INDEXER_API_URL) {
     try {
-      const headers = cfg.INDEXER_API_KEY
-        ? { 'x-api-key': cfg.INDEXER_API_KEY }
-        : {};
+      const headers = cfg.INDEXER_API_KEY ? { 'x-api-key': cfg.INDEXER_API_KEY } : {};
       const resp = await axios.get(
         `${cfg.INDEXER_API_URL}/validator/${cfg.VALIDATOR_ADDRESS}`,
         { headers, timeout: 8000 }
@@ -167,6 +152,9 @@ async function fetchFromLCD() {
   const val = valResp.data.validator;
   console.log(`[FETCHER] Using LCD endpoint: ${valResp.config?.url?.split('/cosmos')[0]}`);
 
+  // ── DIAGNOSTIC: dump the full consensus_pubkey so we can see exactly what we get
+  console.log(`[FETCHER] consensus_pubkey raw: ${JSON.stringify(val.consensus_pubkey)}`);
+
   // 2. All validators for rank
   let rank = 0;
   try {
@@ -181,7 +169,7 @@ async function fetchFromLCD() {
     console.warn('[FETCHER] Rank fetch failed:', e.message);
   }
 
-  // 3. Delegator count — try count_total first, then paginate
+  // 3. Delegator count
   let delegators = 0;
   try {
     const delResp = await lcdGet(
@@ -214,18 +202,20 @@ async function fetchFromLCD() {
     delegators = 0;
   }
 
-  // 4. Missed blocks + uptime via slashing signing_info
+  // 4. Missed blocks + uptime
   let missedBlocks = -1;
   let uptimePct    = -1;
 
   try {
+    console.log('[FETCHER] Attempting consensus address derivation...');
     const consAddress = pubkeyToConsAddress(val.consensus_pubkey);
 
+    console.log(`[FETCHER] Fetching signing info for: ${consAddress}`);
     const signingResp = await lcdGet(
       `/cosmos/slashing/v1beta1/signing_infos/${consAddress}`
     );
     const info = signingResp.data?.val_signing_info;
-    console.log(`[FETCHER] Signing info raw:`, JSON.stringify(info));
+    console.log(`[FETCHER] Signing info raw: ${JSON.stringify(info)}`);
 
     if (info) {
       missedBlocks = parseInt(info.missed_blocks_counter || 0);
@@ -246,7 +236,8 @@ async function fetchFromLCD() {
       console.warn('[FETCHER] val_signing_info was empty in response');
     }
   } catch (e) {
-    console.warn('[FETCHER] Signing info fetch failed:', e.message);
+    console.warn(`[FETCHER] Signing info fetch failed: ${e.message}`);
+    console.warn(`[FETCHER] Stack: ${e.stack}`);
   }
 
   const stakedUcore    = parseFloat(val.tokens || 0);
