@@ -1,6 +1,6 @@
 // fetcher.js — tries indexer API first (if configured), falls back to LCD
 // Uses multiple LCD endpoints with automatic fallback
-// LCD path derives consensus address and fetches real uptime % + missed blocks
+// LCD path derives consensus address and fetches real uptime % + missed blocks + APR
 
 const axios  = require('axios');
 const cfg    = require('./config');
@@ -58,31 +58,22 @@ function toConsAddress(addrBytes) {
   return bech32Encode('corevalcons', words);
 }
 
-/**
- * Returns all candidate consensus addresses for a given ed25519 pubkey.
- * Different Cosmos SDK versions use different derivation methods.
- * We try all three and use whichever one the node accepts.
- *
- * Method 1: Raw SHA256(pubkey)[0:20]  — standard Tendermint
- * Method 2: SHA256(amino_prefix + pubkey)[0:20]  — older Cosmos SDK
- * Method 3: RIPEMD160(SHA256(pubkey))  — used by some chains for account addresses
- */
 function getCandidateConsAddresses(consensusPubkey) {
   const keyBytes = Buffer.from(consensusPubkey.key, 'base64');
 
-  // Method 1: Raw SHA256, first 20 bytes (standard Tendermint consensus address)
-  const hash1     = crypto.createHash('sha256').update(keyBytes).digest();
-  const addr1     = toConsAddress(hash1.slice(0, 20));
+  // Method 1: Raw SHA256[0:20] — correct for Coreum/TX
+  const hash1 = crypto.createHash('sha256').update(keyBytes).digest();
+  const addr1 = toConsAddress(hash1.slice(0, 20));
 
-  // Method 2: Amino-prefixed SHA256 (0x1624de64 = ed25519 amino prefix, 0x20 = 32 byte length)
-  const amino     = Buffer.concat([Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]), keyBytes]);
-  const hash2     = crypto.createHash('sha256').update(amino).digest();
-  const addr2     = toConsAddress(hash2.slice(0, 20));
+  // Method 2: Amino-prefixed SHA256 (fallback)
+  const amino = Buffer.concat([Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]), keyBytes]);
+  const hash2 = crypto.createHash('sha256').update(amino).digest();
+  const addr2 = toConsAddress(hash2.slice(0, 20));
 
-  // Method 3: SHA256 then RIPEMD160
-  const hash3a    = crypto.createHash('sha256').update(keyBytes).digest();
-  const hash3b    = crypto.createHash('ripemd160').update(hash3a).digest();
-  const addr3     = toConsAddress(hash3b);
+  // Method 3: SHA256 + RIPEMD160 (fallback)
+  const hash3a = crypto.createHash('sha256').update(keyBytes).digest();
+  const hash3b = crypto.createHash('ripemd160').update(hash3a).digest();
+  const addr3  = toConsAddress(hash3b);
 
   return [addr1, addr2, addr3];
 }
@@ -149,7 +140,50 @@ function normaliseIndexer(d) {
   return {
     source: 'indexer', moniker, stakedTX: stakedUcore / cfg.DENOM_DIVISOR,
     delegators, rank, jailed, status, missedBlocks, uptimePct, commission, votingPowerPct,
+    slashFractionDoubleSign: 0,
+    slashFractionDowntime:   0,
+    aprGross:                -1,
+    aprDelegator:            -1,
   };
+}
+
+// ── APR calculation ────────────────────────────────────────────────────────
+//
+// APR = (inflation × (1 - community_tax)) / bonded_ratio
+//
+// aprGross     = validator's gross APR before commission
+// aprDelegator = what delegators actually earn after commission is taken
+//
+// All values fetched live from chain so they update automatically with
+// governance changes to inflation, community tax, or bonded ratio.
+
+async function fetchAPR(commissionRate) {
+  try {
+    const [inflationResp, distResp, poolResp] = await Promise.all([
+      lcdGet('/cosmos/mint/v1beta1/inflation'),
+      lcdGet('/cosmos/distribution/v1beta1/params'),
+      lcdGet('/cosmos/staking/v1beta1/pool'),
+    ]);
+
+    const inflation     = parseFloat(inflationResp.data?.inflation      || 0);
+    const communityTax  = parseFloat(distResp.data?.params?.community_tax || 0);
+    const bondedTokens  = parseFloat(poolResp.data?.pool?.bonded_tokens  || 0);
+    const notBonded     = parseFloat(poolResp.data?.pool?.not_bonded_tokens || 0);
+    const totalTokens   = bondedTokens + notBonded;
+    const bondedRatio   = totalTokens > 0 ? bondedTokens / totalTokens : 0;
+
+    if (bondedRatio === 0) throw new Error('bondedRatio is zero');
+
+    const aprGross     = (inflation * (1 - communityTax)) / bondedRatio;
+    const aprDelegator = aprGross * (1 - commissionRate);
+
+    console.log(`[FETCHER] APR — inflation: ${(inflation*100).toFixed(2)}% | community tax: ${(communityTax*100).toFixed(2)}% | bonded ratio: ${(bondedRatio*100).toFixed(2)}% | gross APR: ${(aprGross*100).toFixed(2)}% | delegator APR: ${(aprDelegator*100).toFixed(2)}%`);
+
+    return { aprGross: aprGross * 100, aprDelegator: aprDelegator * 100 };
+  } catch (e) {
+    console.warn('[FETCHER] APR calculation failed:', e.message);
+    return { aprGross: -1, aprDelegator: -1 };
+  }
 }
 
 // ── LCD fetch ──────────────────────────────────────────────────────────────
@@ -209,15 +243,16 @@ async function fetchFromLCD() {
     delegators = 0;
   }
 
-  // 4. Missed blocks + uptime — try each candidate consensus address until one works
-  let missedBlocks = -1;
-  let uptimePct    = -1;
+  // 4. Missed blocks + uptime + slashing params
+  let missedBlocks            = -1;
+  let uptimePct               = -1;
+  let slashFractionDoubleSign = 0;
+  let slashFractionDowntime   = 0;
 
   try {
     const candidates = getCandidateConsAddresses(val.consensus_pubkey);
-    console.log(`[FETCHER] Trying consensus address candidates:`, candidates);
-
     let signingInfo = null;
+
     for (const consAddress of candidates) {
       try {
         const resp = await lcdGet(`/cosmos/slashing/v1beta1/signing_infos/${consAddress}`);
@@ -235,40 +270,50 @@ async function fetchFromLCD() {
     if (signingInfo) {
       missedBlocks = parseInt(signingInfo.missed_blocks_counter || 0);
       console.log(`[FETCHER] Missed blocks: ${missedBlocks}`);
+    }
 
-      try {
-        const paramsResp = await lcdGet(`/cosmos/slashing/v1beta1/params`);
-        const windowSize = parseInt(paramsResp.data?.params?.signed_blocks_window || 0);
-        console.log(`[FETCHER] Signing window: ${windowSize}`);
-        if (windowSize > 0) {
-          uptimePct = ((windowSize - missedBlocks) / windowSize) * 100;
-          console.log(`[FETCHER] Uptime: ${uptimePct.toFixed(3)}%`);
-        }
-      } catch (e) {
-        console.warn('[FETCHER] Slashing params fetch failed:', e.message);
+    // Slashing params — window size, slash fractions
+    try {
+      const paramsResp = await lcdGet(`/cosmos/slashing/v1beta1/params`);
+      const params     = paramsResp.data?.params || {};
+      const windowSize = parseInt(params.signed_blocks_window || 0);
+
+      slashFractionDoubleSign = parseFloat(params.slash_fraction_double_sign || 0);
+      slashFractionDowntime   = parseFloat(params.slash_fraction_downtime    || 0);
+
+      if (windowSize > 0 && missedBlocks >= 0) {
+        uptimePct = ((windowSize - missedBlocks) / windowSize) * 100;
+        console.log(`[FETCHER] Uptime: ${uptimePct.toFixed(3)}% (window: ${windowSize})`);
       }
-    } else {
-      console.warn('[FETCHER] All consensus address candidates returned 404 — signing info unavailable');
+    } catch (e) {
+      console.warn('[FETCHER] Slashing params fetch failed:', e.message);
     }
   } catch (e) {
     console.warn(`[FETCHER] Signing info fetch failed: ${e.message}`);
   }
 
-  const stakedUcore    = parseFloat(val.tokens || 0);
+  // 5. APR — fetched in parallel with above, uses commission rate
   const commissionRate = parseFloat(val.commission?.commission_rates?.rate || 0.05);
+  const { aprGross, aprDelegator } = await fetchAPR(commissionRate);
+
+  const stakedUcore = parseFloat(val.tokens || 0);
 
   return {
-    source:         'lcd',
-    moniker:        val.description?.moniker || 'Unknown',
-    stakedTX:       stakedUcore / cfg.DENOM_DIVISOR,
+    source:                  'lcd',
+    moniker:                 val.description?.moniker || 'Unknown',
+    stakedTX:                stakedUcore / cfg.DENOM_DIVISOR,
     delegators,
     rank,
-    jailed:         val.jailed === true,
-    status:         val.status,
+    jailed:                  val.jailed === true,
+    status:                  val.status,
     missedBlocks,
     uptimePct,
-    commission:     commissionRate * 100,
-    votingPowerPct: 0,
+    commission:              commissionRate * 100,
+    votingPowerPct:          0,
+    slashFractionDoubleSign,
+    slashFractionDowntime,
+    aprGross,
+    aprDelegator,
   };
 }
 
