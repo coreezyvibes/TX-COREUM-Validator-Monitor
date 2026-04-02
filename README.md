@@ -1,6 +1,6 @@
 # 🦥 TX/Coreum Validator Monitor
 
-A lightweight, always-on validator health monitor for the **TX Ecosystem** (formerly Coreum). Get instant Telegram alerts when something changes with your validator — jailing, rank shifts, staking changes, delegator activity, and more.
+A lightweight, always-on validator health monitor for the **TX Ecosystem** (formerly Coreum). Get instant Telegram alerts when something changes with your validator — jailing, rank shifts, staking changes, delegator activity, slashing penalties, APR tracking, price, and projected revenue.
 
 Built by [Coreezy](https://coreezy.xyz) — **Stake. Vibe. Grow.**
 
@@ -12,18 +12,64 @@ Checks your validator every 10 minutes and fires Telegram alerts for:
 
 | Alert | Trigger |
 |---|---|
-| 🚨 Validator Jailed | Detected jailed status |
+| 🚨 Validator Jailed | Detected jailed status + full slashing penalty breakdown |
 | 🔴 Validator Unreachable | All LCD endpoints failed |
-| ⚠️ Uptime Drop | Falls below your threshold (requires indexer) |
-| ⚠️ Missed Blocks | Counter jumps by 10+ in one check (requires indexer) |
+| ⚠️ Uptime Drop | Falls below your configured threshold |
+| ⚠️ Missed Blocks | Counter jumps by 10+ in one check |
 | 🟢/🔴 Rank Changed | Any position change |
 | 🟢/🔴 Staked TX Changed | Changes by 50K+ TX |
 | 🟢/🔴 Delegator Count | Any change — up or down |
-| 🟢/🔴 Voting Power | Moves by 5%+ (requires indexer) |
+| 🟢/🔴 Voting Power | Moves by 5%+ |
 
-Plus a **4-hour digest** sent with the Coreezy sloth gif — showing all stats with ▲/▼ deltas vs the previous report: rank, staked TX, delegators, uptime, missed blocks, commission.
+Plus a **4-hour digest** sent with the Coreezy sloth gif — showing all stats with ▲/▼ deltas vs the previous report.
 
 On startup the bot immediately fetches current stats and sends the first digest so you know it's working right away.
+
+---
+
+## What's in the Digest
+
+Every 4-hour report includes:
+
+- **Status** — Online & Bonded or Jailed
+- **Rank** — with position delta vs last report
+- **Staked TX** — total delegation with change
+- **Delegators** — count with change
+- **Uptime** — % based on signing window (live from chain)
+- **Missed Blocks** — raw counter from slashing module
+- **Commission** — your current rate
+- **Staking APR** — gross and delegator APR, inflation rate
+- **TX Price** — live USD price via CoinGecko
+- **Est. Monthly Revenue** — your projected commission earnings in USD
+
+APR starts as a network-wide estimate and automatically switches to **real earnings-based APR** after 2 checks (~20 minutes), calculated from your validator's actual accumulated rewards. The more data collected, the more accurate it becomes — after 24 hours it uses a full rolling window.
+
+All times are displayed in **Eastern Time (ET)**, automatically handling EST/EDT transitions.
+
+---
+
+## Jail Alert — Slashing Penalty Breakdown
+
+When your validator is jailed, the alert immediately shows both possible penalty amounts based on live chain parameters:
+
+```
+🚨 VALIDATOR JAILED!
+
+Your validator has been jailed.
+Status: BOND_STATUS_UNBONDING
+Staked: 5.10M TX
+Rank: #34
+
+⚠️ Slashing Penalties (on 5.10M TX staked)
+Downtime slash:     0.0100% = 510 TX
+Double-sign slash:  5.0000% = 255.1K TX
+
+Verify slash type on chain to confirm exact delegator reimbursement amount.
+
+⚡ Action required immediately!
+```
+
+Penalty amounts are calculated from live chain slashing parameters and update automatically if governance changes them.
 
 ---
 
@@ -53,7 +99,7 @@ This monitor requires a Telegram bot to send you alerts. You need to create your
 ### 1b. Get your Chat ID
 
 1. Search for your new bot in Telegram and send it `/start`
-2. Then open this URL in your browser (replace `YOUR_BOT_TOKEN`):
+2. Open this URL in your browser (replace `YOUR_BOT_TOKEN`):
    ```
    https://api.telegram.org/botYOUR_BOT_TOKEN/getUpdates
    ```
@@ -110,24 +156,24 @@ Only 3 are required. Everything else has sensible defaults.
 | `TELEGRAM_BOT_TOKEN` | From BotFather (Step 1a) |
 | `TELEGRAM_CHAT_ID` | Your numeric Telegram chat ID (Step 1b) |
 
-### Optional — Performance gif caching
+### Optional — GIF caching
 
-On first startup the bot uploads the Coreezy gif to Telegram and logs the `file_id`. To skip the upload on future restarts, add:
+On first startup the bot uploads the Coreezy gif to Telegram and logs the `file_id`. To skip the re-upload on future restarts, copy the logged `file_id` and add it as an env var:
 
 | Variable | Description |
 |---|---|
-| `GIF_FILE_ID` | Telegram file_id logged on first startup — paste it here to cache permanently |
+| `GIF_FILE_ID` | Telegram file_id logged on first startup |
 
 ### Optional — Indexer API
 
-For richer metrics (uptime %, missed blocks, voting power), point to a compatible TX indexer:
+Point to a compatible TX indexer for additional data sources:
 
 | Variable | Description |
 |---|---|
 | `INDEXER_API_URL` | Base URL of your indexer (e.g. `https://your-indexer.railway.app`) |
 | `INDEXER_API_KEY` | API key if your indexer requires one |
 
-> Don't have an indexer? No problem — the monitor works fully out of the box using public LCD nodes.
+> Don't have an indexer? No problem — the monitor works fully out of the box using public LCD nodes. Uptime %, missed blocks, APR, and price all work without one.
 
 ### Optional — Thresholds
 
@@ -140,34 +186,40 @@ For richer metrics (uptime %, missed blocks, voting power), point to a compatibl
 | `STAKED_CHANGE_ALERT_TX` | `50000` | Alert if staked TX changes by this amount |
 | `MISSED_BLOCKS_ALERT` | `10` | Alert if missed blocks jumps by this per check |
 | `RANK_CHANGE_ALERT` | `1` | Min rank positions to trigger alert |
-| `LCD_URL` | publicnode | Primary TX LCD endpoint — falls back automatically if unavailable |
+| `LCD_URL` | publicnode | Primary TX LCD endpoint — falls back automatically |
 
 ---
 
 ## What the Alerts Look Like
 
-**On startup — immediate digest with gif:**
-
-![Coreezy Validator Digest](assets/tenor%20Vibin.gif)
+**4-hour digest:**
 
 ```
-🦥 Validator Report — Sun, 29 Mar 2026 00:42:56 GMT
+🦥 Validator Report — Thu, Apr 03 2026, 5:03 PM EDT
 
 Status
 ✅ Online & Bonded
 
 Rank
-— #34
+─ #34
 
 Staked
-— 4.86M TX
+▲ 5.10M TX (+12.3K)
 
 Delegators
-— 135
+▲ 138 (+1)
 
-Uptime  N/A
-Missed Blocks  N/A
+Uptime  100.000%
+Missed Blocks  0
 Commission  5.0%
+
+Staking APR
+Gross:      14.81%
+Delegator:  14.07%
+Inflation:  0.1487%
+
+TX Price  $0.0891
+Est. Monthly Revenue  $189.42
 
 Stake. Vibe. Grow. 🌴
 ```
@@ -186,8 +238,14 @@ Moved up 1 position
 
 Your validator has been jailed.
 Status: BOND_STATUS_UNBONDING
-Staked: 4.86M TX
+Staked: 5.10M TX
 Rank: #34
+
+⚠️ Slashing Penalties (on 5.10M TX staked)
+Downtime slash:     0.0100% = 510 TX
+Double-sign slash:  5.0000% = 255.1K TX
+
+Verify slash type on chain to confirm exact delegator reimbursement amount.
 
 ⚡ Action required immediately!
 ```
@@ -196,22 +254,58 @@ Rank: #34
 
 ## Data Sources
 
-The monitor uses a three-tier approach with automatic fallback:
+The monitor uses a multi-tier approach with automatic fallback for all LCD calls:
 
-1. **Indexer API** (optional) — richer data including uptime %, missed blocks, voting power
+1. **Indexer API** (optional) — if configured, used first
 2. **Primary LCD** — your configured `LCD_URL` (defaults to publicnode)
-3. **Official Coreum node** — `full-node.mainnet-1.coreum.dev`
-4. **Cosmos Directory proxy** — `rest.cosmos.directory/coreum`
+3. **TX Archive node** — `archive.rest.mainnet-1.tx.org`
+4. **Official Coreum node** — `full-node.mainnet-1.coreum.dev`
+5. **Cosmos Directory proxy** — `rest.cosmos.directory/coreum`
 
-If one source fails, the next is tried automatically. The monitor never goes dark due to a single node being down.
+If one source fails, the next is tried automatically.
 
-> Uptime % and missed blocks require an indexer — they show as N/A in LCD-only mode. This will be unlocked in a future update.
+**Additional data sources:**
+- **CoinGecko** — free public API for live TX/USD price, no key required
+- **Cosmos mint module** — `annual_provisions` for accurate APR calculation
+- **Cosmos distribution module** — validator outstanding rewards for real earnings-based APR
+- **Cosmos slashing module** — signing info for uptime/missed blocks, params for slash fractions
+
+---
+
+## APR Methodology
+
+APR is calculated in two stages:
+
+**Stage 1 — Projection (first ~20 minutes after startup):**
+Uses the chain's `annual_provisions` divided by total bonded tokens, adjusted for community tax. Shown with *(est.)* label in the digest.
+
+**Stage 2 — Real earnings (after 2+ checks):**
+Tracks your validator's actual accumulated rewards from the distribution module. Diffs consecutive readings to calculate a real earn rate, then annualises it. After 24 hours this uses a full rolling window for maximum accuracy. The *(est.)* label disappears once real data is available.
+
+Reward snapshots are persisted to `data/rewards_state.json` and survive restarts.
 
 ---
 
 ## No Cron Required
 
 The check schedule is built into the bot — no external cron job needed. As long as your service is running (Railway always-on, pm2, systemd), it loops automatically every 10 minutes and sends the digest every 4 hours.
+
+---
+
+## Project Structure
+
+```
+src/
+  index.js          — main loop, alert scheduling
+  fetcher.js        — all chain data fetching and LCD fallback logic
+  alerts.js         — Telegram message formatting and sending
+  config.js         — environment variable loading
+  rewardsTracker.js — rolling rewards accumulator for real APR
+data/
+  rewards_state.json  — persisted reward snapshots (auto-created)
+assets/
+  tenor Vibin.gif   — the Coreezy sloth gif
+```
 
 ---
 
