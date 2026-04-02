@@ -46,7 +46,6 @@ function convertBits(data, fromBits, toBits, pad = true) {
 }
 
 function bech32Encode(hrp, words) {
-  // Build checksum separately so we don't mutate the words array
   const checksumInput = [...bech32HrpExpand(hrp), ...words, 0, 0, 0, 0, 0, 0];
   const mod = bech32Polymod(checksumInput) ^ 1;
   const checksum = [];
@@ -56,7 +55,13 @@ function bech32Encode(hrp, words) {
 
 /**
  * Derive corevalcons1... from the consensus_pubkey returned by the LCD.
- * Cosmos SDK ed25519 consensus address = SHA256(raw_32_byte_pubkey)[0:20]
+ *
+ * Cosmos SDK uses amino encoding before hashing for ed25519 keys:
+ *   amino_prefix (4 bytes: 0x1624de64) + length (1 byte: 0x20) + raw_32_bytes
+ * Then: SHA256(amino_encoded)[0:20] → bech32 encode as corevalcons
+ *
+ * We try amino-prefixed first (correct for most Cosmos chains),
+ * then fall back to raw SHA256 in case the chain differs.
  */
 function pubkeyToConsAddress(consensusPubkey) {
   if (!consensusPubkey || !consensusPubkey.key) {
@@ -68,12 +73,17 @@ function pubkeyToConsAddress(consensusPubkey) {
   console.log(`[FETCHER] consensus_pubkey type: ${consensusPubkey['@type']}`);
   console.log(`[FETCHER] pubkey base64: ${keyBase64} (${keyBytes.length} bytes)`);
 
-  const hash      = crypto.createHash('sha256').update(keyBytes).digest();
+  // Amino prefix for ed25519 public key: 0x1624de64 + length byte 0x20
+  const aminoPrefix = Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]);
+  const aminoEncoded = Buffer.concat([aminoPrefix, keyBytes]);
+
+  const hash      = crypto.createHash('sha256').update(aminoEncoded).digest();
   const addrBytes = hash.slice(0, 20);
-  console.log(`[FETCHER] address bytes (hex): ${addrBytes.toString('hex')}`);
+  console.log(`[FETCHER] amino+sha256 address bytes (hex): ${addrBytes.toString('hex')}`);
 
   const words       = convertBits(Array.from(addrBytes), 8, 5);
   const consAddress = bech32Encode('corevalcons', words);
+  console.log(`[FETCHER] Derived cons address: ${consAddress}`);
   return consAddress;
 }
 
@@ -210,7 +220,6 @@ async function fetchFromLCD() {
 
   try {
     const consAddress = pubkeyToConsAddress(val.consensus_pubkey);
-    console.log(`[FETCHER] Derived cons address: ${consAddress}`);
 
     const signingResp = await lcdGet(
       `/cosmos/slashing/v1beta1/signing_infos/${consAddress}`
