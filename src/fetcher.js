@@ -1,6 +1,6 @@
 // fetcher.js — tries indexer API first (if configured), falls back to LCD
 // Uses multiple LCD endpoints with automatic fallback
-// LCD path derives consensus address and fetches real uptime % + missed blocks + APR
+// LCD path derives consensus address and fetches real uptime % + missed blocks + APR + price
 
 const axios  = require('axios');
 const cfg    = require('./config');
@@ -61,16 +61,13 @@ function toConsAddress(addrBytes) {
 function getCandidateConsAddresses(consensusPubkey) {
   const keyBytes = Buffer.from(consensusPubkey.key, 'base64');
 
-  // Method 1: Raw SHA256[0:20] — correct for Coreum/TX
   const hash1 = crypto.createHash('sha256').update(keyBytes).digest();
   const addr1 = toConsAddress(hash1.slice(0, 20));
 
-  // Method 2: Amino-prefixed SHA256 (fallback)
   const amino = Buffer.concat([Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]), keyBytes]);
   const hash2 = crypto.createHash('sha256').update(amino).digest();
   const addr2 = toConsAddress(hash2.slice(0, 20));
 
-  // Method 3: SHA256 + RIPEMD160 (fallback)
   const hash3a = crypto.createHash('sha256').update(keyBytes).digest();
   const hash3b = crypto.createHash('ripemd160').update(hash3a).digest();
   const addr3  = toConsAddress(hash3b);
@@ -142,47 +139,78 @@ function normaliseIndexer(d) {
     delegators, rank, jailed, status, missedBlocks, uptimePct, commission, votingPowerPct,
     slashFractionDoubleSign: 0,
     slashFractionDowntime:   0,
-    aprGross:                -1,
-    aprDelegator:            -1,
+    aprGross:       -1,
+    aprDelegator:   -1,
+    inflationRate:  -1,
+    txPriceUsd:     -1,
+    monthlyRevenueUsd: -1,
   };
 }
 
-// ── APR calculation ────────────────────────────────────────────────────────
-//
-// APR = (inflation × (1 - community_tax)) / bonded_ratio
-//
-// aprGross     = validator's gross APR before commission
-// aprDelegator = what delegators actually earn after commission is taken
-//
-// All values fetched live from chain so they update automatically with
-// governance changes to inflation, community tax, or bonded ratio.
+// ── TX price from CoinGecko (free tier, no key needed) ────────────────────
 
-async function fetchAPR(commissionRate) {
+async function fetchTxPrice() {
   try {
-    const [inflationResp, distResp, poolResp] = await Promise.all([
+    const resp = await axios.get(
+      'https://api.coingecko.com/api/v3/simple/price?ids=coreum&vs_currencies=usd',
+      { timeout: 8000 }
+    );
+    const price = resp.data?.coreum?.usd;
+    if (!price) throw new Error('No price returned');
+    console.log(`[FETCHER] TX price: $${price}`);
+    return price;
+  } catch (e) {
+    console.warn('[FETCHER] TX price fetch failed:', e.message);
+    return -1;
+  }
+}
+
+// ── APR + inflation calculation ───────────────────────────────────────────
+//
+// Coreum uses a variable inflation model — the mint module's annual_provisions
+// reflects the actual tokens to be minted this year, which is the correct
+// basis for APR (not the raw inflation rate fraction).
+//
+// APR    = annual_provisions × (1 - community_tax) / bonded_tokens
+// inflation_rate is fetched separately and shown for informational purposes.
+
+async function fetchAPRAndInflation(commissionRate) {
+  try {
+    const [provisionsResp, inflationResp, distResp, poolResp] = await Promise.all([
+      lcdGet('/cosmos/mint/v1beta1/annual_provisions'),
       lcdGet('/cosmos/mint/v1beta1/inflation'),
       lcdGet('/cosmos/distribution/v1beta1/params'),
       lcdGet('/cosmos/staking/v1beta1/pool'),
     ]);
 
-    const inflation     = parseFloat(inflationResp.data?.inflation      || 0);
-    const communityTax  = parseFloat(distResp.data?.params?.community_tax || 0);
-    const bondedTokens  = parseFloat(poolResp.data?.pool?.bonded_tokens  || 0);
-    const notBonded     = parseFloat(poolResp.data?.pool?.not_bonded_tokens || 0);
-    const totalTokens   = bondedTokens + notBonded;
-    const bondedRatio   = totalTokens > 0 ? bondedTokens / totalTokens : 0;
+    const annualProvisions = parseFloat(provisionsResp.data?.annual_provisions || 0);
+    const inflationRate    = parseFloat(inflationResp.data?.inflation           || 0);
+    const communityTax     = parseFloat(distResp.data?.params?.community_tax   || 0);
+    const bondedTokens     = parseFloat(poolResp.data?.pool?.bonded_tokens     || 0);
 
-    if (bondedRatio === 0) throw new Error('bondedRatio is zero');
+    if (bondedTokens === 0) throw new Error('bondedTokens is zero');
 
-    const aprGross     = (inflation * (1 - communityTax)) / bondedRatio;
-    const aprDelegator = aprGross * (1 - commissionRate);
+    const stakerProvisions = annualProvisions * (1 - communityTax);
+    const aprGross         = stakerProvisions / bondedTokens;
+    const aprDelegator     = aprGross * (1 - commissionRate);
 
-    console.log(`[FETCHER] APR — inflation: ${(inflation*100).toFixed(2)}% | community tax: ${(communityTax*100).toFixed(2)}% | bonded ratio: ${(bondedRatio*100).toFixed(2)}% | gross APR: ${(aprGross*100).toFixed(2)}% | delegator APR: ${(aprDelegator*100).toFixed(2)}%`);
+    console.log(
+      `[FETCHER] APR — annual_provisions: ${(annualProvisions / 1e6).toFixed(0)} TX` +
+      ` | inflation: ${(inflationRate * 100).toFixed(4)}%` +
+      ` | community_tax: ${(communityTax * 100).toFixed(2)}%` +
+      ` | bonded: ${(bondedTokens / 1e6).toFixed(0)} TX` +
+      ` | gross APR: ${(aprGross * 100).toFixed(2)}%` +
+      ` | delegator APR: ${(aprDelegator * 100).toFixed(2)}%`
+    );
 
-    return { aprGross: aprGross * 100, aprDelegator: aprDelegator * 100 };
+    return {
+      aprGross:      aprGross * 100,
+      aprDelegator:  aprDelegator * 100,
+      inflationRate: inflationRate * 100,
+    };
   } catch (e) {
     console.warn('[FETCHER] APR calculation failed:', e.message);
-    return { aprGross: -1, aprDelegator: -1 };
+    return { aprGross: -1, aprDelegator: -1, inflationRate: -1 };
   }
 }
 
@@ -272,7 +300,6 @@ async function fetchFromLCD() {
       console.log(`[FETCHER] Missed blocks: ${missedBlocks}`);
     }
 
-    // Slashing params — window size, slash fractions
     try {
       const paramsResp = await lcdGet(`/cosmos/slashing/v1beta1/params`);
       const params     = paramsResp.data?.params || {};
@@ -292,16 +319,29 @@ async function fetchFromLCD() {
     console.warn(`[FETCHER] Signing info fetch failed: ${e.message}`);
   }
 
-  // 5. APR — fetched in parallel with above, uses commission rate
+  // 5. APR, inflation rate, and TX price — fetched in parallel
   const commissionRate = parseFloat(val.commission?.commission_rates?.rate || 0.05);
-  const { aprGross, aprDelegator } = await fetchAPR(commissionRate);
+  const stakedUcore    = parseFloat(val.tokens || 0);
+  const stakedTX       = stakedUcore / cfg.DENOM_DIVISOR;
 
-  const stakedUcore = parseFloat(val.tokens || 0);
+  const [{ aprGross, aprDelegator, inflationRate }, txPriceUsd] = await Promise.all([
+    fetchAPRAndInflation(commissionRate),
+    fetchTxPrice(),
+  ]);
+
+  // Monthly revenue = validator's commission share of annual staking rewards / 12
+  // = staked_TX × gross_APR × commission_rate / 12 × price
+  let monthlyRevenueUsd = -1;
+  if (aprGross >= 0 && txPriceUsd > 0) {
+    const annualRevenueTX  = stakedTX * (aprGross / 100) * commissionRate;
+    monthlyRevenueUsd      = (annualRevenueTX / 12) * txPriceUsd;
+    console.log(`[FETCHER] Monthly revenue: $${monthlyRevenueUsd.toFixed(2)} (${annualRevenueTX.toFixed(0)} TX/yr @ $${txPriceUsd})`);
+  }
 
   return {
     source:                  'lcd',
     moniker:                 val.description?.moniker || 'Unknown',
-    stakedTX:                stakedUcore / cfg.DENOM_DIVISOR,
+    stakedTX,
     delegators,
     rank,
     jailed:                  val.jailed === true,
@@ -314,6 +354,9 @@ async function fetchFromLCD() {
     slashFractionDowntime,
     aprGross,
     aprDelegator,
+    inflationRate,
+    txPriceUsd,
+    monthlyRevenueUsd,
   };
 }
 
