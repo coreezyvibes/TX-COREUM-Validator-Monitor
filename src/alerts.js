@@ -137,7 +137,7 @@ function uptimeAlert(current, previous) {
   const direction = current < previous ? '📉' : '📈';
   return send(
     `⚠️ <b>Uptime Drop Alert</b>\n\n` +
-    `${direction} Uptime: <b>${current.toFixed(3)}%</b> (was ${previous.toFixed(3)}%)\n` +
+    `${direction} Uptime: <b>${current.toFixed(2)}%</b> (was ${previous.toFixed(2)}%)\n` +
     `Threshold: ${cfg.UPTIME_ALERT_THRESHOLD}%\n\n` +
     `Monitor your node — missed blocks detected.`
   );
@@ -213,11 +213,11 @@ function summaryAlert(stats, prev) {
   const delArrow    = delDelta    > 0 ? '▲' : delDelta    < 0 ? '▼' : '─';
   const rankArrow   = rankDelta   > 0 ? '▲' : rankDelta   < 0 ? '▼' : '─';
 
-  const uptimeStr   = stats.uptimePct     >= 0 ? `${stats.uptimePct.toFixed(3)}%`     : 'N/A';
+  const uptimeStr   = stats.uptimePct     >= 0 ? `${stats.uptimePct.toFixed(2)}%`     : 'N/A';
   const missedStr   = stats.missedBlocks  >= 0 ? `${stats.missedBlocks}`              : 'N/A';
   const aprGrossStr = stats.aprGross      >= 0 ? `${stats.aprGross.toFixed(2)}%`      : 'N/A';
   const aprDelStr   = stats.aprDelegator  >= 0 ? `${stats.aprDelegator.toFixed(2)}%`  : 'N/A';
-  const inflStr     = stats.inflationRate >= 0 ? `${stats.inflationRate.toFixed(4)}%` : 'N/A';
+  const inflStr     = stats.inflationRate >= 0 ? `${stats.inflationRate.toFixed(3)}%` : 'N/A';
   const priceStr    = stats.txPriceUsd    >  0 ? `$${stats.txPriceUsd.toFixed(4)}`   : 'N/A';
   const revenueStr  = stats.monthlyRevenueUsd > 0
     ? `$${stats.monthlyRevenueUsd.toFixed(2)}`
