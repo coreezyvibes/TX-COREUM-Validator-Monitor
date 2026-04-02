@@ -1,12 +1,78 @@
 // fetcher.js — tries indexer API first (if configured), falls back to LCD
 // Uses multiple LCD endpoints with automatic fallback
+// LCD path now derives consensus address and fetches real uptime % + missed blocks
 
-const axios = require('axios');
-const cfg   = require('./config');
+const axios  = require('axios');
+const cfg    = require('./config');
+const crypto = require('crypto');
 
-// Ordered list of LCD endpoints to try — first working one wins
+// ── Bech32 utility (no external deps) ─────────────────────────────────────
+// Used to convert the validator's ed25519/secp256k1 pubkey → corevalcons1... address
+
+const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+
+function bech32Polymod(values) {
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((top >> i) & 1) chk ^= GEN[i];
+  }
+  return chk;
+}
+
+function bech32HrpExpand(hrp) {
+  const ret = [];
+  for (let i = 0; i < hrp.length; i++) ret.push(hrp.charCodeAt(i) >> 5);
+  ret.push(0);
+  for (let i = 0; i < hrp.length; i++) ret.push(hrp.charCodeAt(i) & 31);
+  return ret;
+}
+
+function bech32Encode(hrp, data) {
+  const combined = [...data, 0, 0, 0, 0, 0, 0];
+  const mod = bech32Polymod([...bech32HrpExpand(hrp), ...combined]) ^ 1;
+  for (let i = 0; i < 6; i++) combined[data.length + i] = (mod >> (5 * (5 - i))) & 31;
+  return hrp + '1' + combined.map(d => BECH32_CHARSET[d]).join('');
+}
+
+function convertBits(data, fromBits, toBits, pad = true) {
+  let acc = 0, bits = 0;
+  const result = [];
+  const maxv = (1 << toBits) - 1;
+  for (const value of data) {
+    acc = (acc << fromBits) | value;
+    bits += fromBits;
+    while (bits >= toBits) {
+      bits -= toBits;
+      result.push((acc >> bits) & maxv);
+    }
+  }
+  if (pad && bits > 0) result.push((acc << (toBits - bits)) & maxv);
+  return result;
+}
+
+/**
+ * Derive corevalcons1... address from the consensus pubkey returned by LCD.
+ * The LCD returns consensus_pubkey as { '@type': '...Ed25519...', key: '<base64>' }
+ * We SHA256 the raw 32-byte pubkey and take the first 20 bytes → bech32 encode.
+ */
+function pubkeyToConsAddress(consensusPubkey) {
+  // key is base64-encoded 32-byte ed25519 public key
+  const keyBytes = Buffer.from(consensusPubkey.key, 'base64');
+  // Cosmos uses SHA256(pubkey)[0:20] as the address bytes
+  const hash = crypto.createHash('sha256').update(keyBytes).digest();
+  const addressBytes = hash.slice(0, 20);
+  const words = convertBits(Array.from(addressBytes), 8, 5);
+  return bech32Encode('corevalcons', words);
+}
+
+// ── LCD endpoints ──────────────────────────────────────────────────────────
+
 const LCD_ENDPOINTS = [
   cfg.LCD_URL,
+  'https://archive.rest.mainnet-1.tx.org',
   'https://full-node.mainnet-1.coreum.dev:1317',
   'https://rest.cosmos.directory/coreum',
 ];
@@ -25,6 +91,8 @@ async function lcdGet(path) {
   }
   throw new Error(`All LCD endpoints failed:\n${errors.join('\n')}`);
 }
+
+// ── Main entry ─────────────────────────────────────────────────────────────
 
 async function fetchValidatorStats() {
 
@@ -70,6 +138,8 @@ function normaliseIndexer(d) {
   };
 }
 
+// ── LCD fetch ──────────────────────────────────────────────────────────────
+
 async function fetchFromLCD() {
   // 1. Validator details
   const valResp = await lcdGet(
@@ -92,39 +162,71 @@ async function fetchFromLCD() {
     console.warn('[FETCHER] Rank fetch failed:', e.message);
   }
 
-  // 3. Delegator count — paginate through all pages
+  // 3. Delegator count — try count_total first, then paginate
   let delegators = 0;
   try {
-    let nextKey = null;
-    let page = 0;
-    do {
-      const qs = nextKey
-        ? `?pagination.limit=200&pagination.key=${encodeURIComponent(nextKey)}`
-        : `?pagination.limit=200&pagination.count_total=true`;
-
-      const delResp = await lcdGet(
-        `/cosmos/staking/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/delegations${qs}`
-      );
-
-      // Try total from pagination first (fastest)
-      const total = parseInt(delResp.data?.pagination?.total || 0);
-      if (total > 0 && page === 0) {
-        delegators = total;
-        console.log(`[FETCHER] Delegators (from total): ${delegators}`);
-        break;
-      }
-
-      // Otherwise count manually
-      const entries = delResp.data?.delegation_responses || [];
-      delegators += entries.length;
-      nextKey = delResp.data?.pagination?.next_key || null;
-      page++;
-      if (page >= 10) break; // safety cap at 2000 delegations
-    } while (nextKey);
-
-    console.log(`[FETCHER] Delegators (counted): ${delegators}`);
+    const delResp = await lcdGet(
+      `/cosmos/staking/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/delegations?pagination.limit=1&pagination.count_total=true`
+    );
+    const total = parseInt(delResp.data?.pagination?.total || 0);
+    if (total > 0) {
+      delegators = total;
+      console.log(`[FETCHER] Delegators: ${delegators}`);
+    } else {
+      let nextKey = null;
+      let page = 0;
+      do {
+        const qs = nextKey
+          ? `?pagination.limit=200&pagination.key=${encodeURIComponent(nextKey)}`
+          : `?pagination.limit=200`;
+        const pageResp = await lcdGet(
+          `/cosmos/staking/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/delegations${qs}`
+        );
+        const entries = pageResp.data?.delegation_responses || [];
+        delegators += entries.length;
+        nextKey = pageResp.data?.pagination?.next_key || null;
+        page++;
+        if (page >= 10) break;
+      } while (nextKey);
+      console.log(`[FETCHER] Delegators (paginated): ${delegators}`);
+    }
   } catch (e) {
     console.warn('[FETCHER] Delegator count failed:', e.message);
+    delegators = 0;
+  }
+
+  // 4. Missed blocks + uptime via slashing signing_info
+  //    Derive corevalcons1... from the validator's consensus pubkey automatically
+  let missedBlocks   = -1;
+  let uptimePct      = -1;
+
+  try {
+    const consAddress = pubkeyToConsAddress(val.consensus_pubkey);
+    console.log(`[FETCHER] Derived cons address: ${consAddress}`);
+
+    const signingResp = await lcdGet(
+      `/cosmos/slashing/v1beta1/signing_infos/${consAddress}`
+    );
+    const info = signingResp.data?.val_signing_info;
+
+    if (info) {
+      missedBlocks = parseInt(info.missed_blocks_counter || 0);
+      console.log(`[FETCHER] Missed blocks: ${missedBlocks}`);
+
+      // Fetch slashing params to get the signing window size
+      try {
+        const paramsResp = await lcdGet(`/cosmos/slashing/v1beta1/params`);
+        const windowSize = parseInt(paramsResp.data?.params?.signed_blocks_window || 0);
+        if (windowSize > 0) {
+          uptimePct = ((windowSize - missedBlocks) / windowSize) * 100;
+          console.log(`[FETCHER] Uptime: ${uptimePct.toFixed(3)}% (window: ${windowSize})`);
+        }
+      } catch (e) {
+        console.warn('[FETCHER] Slashing params fetch failed:', e.message);
+      }
+    }
+  } catch (e) {
+    console.warn('[FETCHER] Signing info fetch failed:', e.message);
   }
 
   const stakedUcore    = parseFloat(val.tokens || 0);
@@ -138,8 +240,8 @@ async function fetchFromLCD() {
     rank,
     jailed:         val.jailed === true,
     status:         val.status,
-    missedBlocks:   -1,
-    uptimePct:      -1,
+    missedBlocks,
+    uptimePct,
     commission:     commissionRate * 100,
     votingPowerPct: 0,
   };
