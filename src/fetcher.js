@@ -53,28 +53,38 @@ function bech32Encode(hrp, words) {
   return hrp + '1' + [...words, ...checksum].map(d => BECH32_CHARSET[d]).join('');
 }
 
-function pubkeyToConsAddress(consensusPubkey) {
-  if (!consensusPubkey || !consensusPubkey.key) {
-    throw new Error(`consensus_pubkey missing or has no key field: ${JSON.stringify(consensusPubkey)}`);
-  }
+function toConsAddress(addrBytes) {
+  const words = convertBits(Array.from(addrBytes), 8, 5);
+  return bech32Encode('corevalcons', words);
+}
 
-  const keyBase64 = consensusPubkey.key;
-  const keyBytes  = Buffer.from(keyBase64, 'base64');
-  console.log(`[FETCHER] consensus_pubkey type: ${consensusPubkey['@type']}`);
-  console.log(`[FETCHER] pubkey base64: ${keyBase64} (${keyBytes.length} bytes)`);
+/**
+ * Returns all candidate consensus addresses for a given ed25519 pubkey.
+ * Different Cosmos SDK versions use different derivation methods.
+ * We try all three and use whichever one the node accepts.
+ *
+ * Method 1: Raw SHA256(pubkey)[0:20]  — standard Tendermint
+ * Method 2: SHA256(amino_prefix + pubkey)[0:20]  — older Cosmos SDK
+ * Method 3: RIPEMD160(SHA256(pubkey))  — used by some chains for account addresses
+ */
+function getCandidateConsAddresses(consensusPubkey) {
+  const keyBytes = Buffer.from(consensusPubkey.key, 'base64');
 
-  // Amino prefix for ed25519: 0x1624de64 + length byte 0x20
-  const aminoPrefix  = Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]);
-  const aminoEncoded = Buffer.concat([aminoPrefix, keyBytes]);
+  // Method 1: Raw SHA256, first 20 bytes (standard Tendermint consensus address)
+  const hash1     = crypto.createHash('sha256').update(keyBytes).digest();
+  const addr1     = toConsAddress(hash1.slice(0, 20));
 
-  const hash      = crypto.createHash('sha256').update(aminoEncoded).digest();
-  const addrBytes = hash.slice(0, 20);
-  console.log(`[FETCHER] address bytes (hex): ${addrBytes.toString('hex')}`);
+  // Method 2: Amino-prefixed SHA256 (0x1624de64 = ed25519 amino prefix, 0x20 = 32 byte length)
+  const amino     = Buffer.concat([Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]), keyBytes]);
+  const hash2     = crypto.createHash('sha256').update(amino).digest();
+  const addr2     = toConsAddress(hash2.slice(0, 20));
 
-  const words       = convertBits(Array.from(addrBytes), 8, 5);
-  const consAddress = bech32Encode('corevalcons', words);
-  console.log(`[FETCHER] Derived cons address: ${consAddress}`);
-  return consAddress;
+  // Method 3: SHA256 then RIPEMD160
+  const hash3a    = crypto.createHash('sha256').update(keyBytes).digest();
+  const hash3b    = crypto.createHash('ripemd160').update(hash3a).digest();
+  const addr3     = toConsAddress(hash3b);
+
+  return [addr1, addr2, addr3];
 }
 
 // ── LCD endpoints ──────────────────────────────────────────────────────────
@@ -152,9 +162,6 @@ async function fetchFromLCD() {
   const val = valResp.data.validator;
   console.log(`[FETCHER] Using LCD endpoint: ${valResp.config?.url?.split('/cosmos')[0]}`);
 
-  // ── DIAGNOSTIC: dump the full consensus_pubkey so we can see exactly what we get
-  console.log(`[FETCHER] consensus_pubkey raw: ${JSON.stringify(val.consensus_pubkey)}`);
-
   // 2. All validators for rank
   let rank = 0;
   try {
@@ -202,23 +209,31 @@ async function fetchFromLCD() {
     delegators = 0;
   }
 
-  // 4. Missed blocks + uptime
+  // 4. Missed blocks + uptime — try each candidate consensus address until one works
   let missedBlocks = -1;
   let uptimePct    = -1;
 
   try {
-    console.log('[FETCHER] Attempting consensus address derivation...');
-    const consAddress = pubkeyToConsAddress(val.consensus_pubkey);
+    const candidates = getCandidateConsAddresses(val.consensus_pubkey);
+    console.log(`[FETCHER] Trying consensus address candidates:`, candidates);
 
-    console.log(`[FETCHER] Fetching signing info for: ${consAddress}`);
-    const signingResp = await lcdGet(
-      `/cosmos/slashing/v1beta1/signing_infos/${consAddress}`
-    );
-    const info = signingResp.data?.val_signing_info;
-    console.log(`[FETCHER] Signing info raw: ${JSON.stringify(info)}`);
+    let signingInfo = null;
+    for (const consAddress of candidates) {
+      try {
+        const resp = await lcdGet(`/cosmos/slashing/v1beta1/signing_infos/${consAddress}`);
+        const info = resp.data?.val_signing_info;
+        if (info && info.address) {
+          console.log(`[FETCHER] ✅ Signing info found with address: ${consAddress}`);
+          signingInfo = info;
+          break;
+        }
+      } catch (e) {
+        console.log(`[FETCHER] ❌ ${consAddress} — ${e.message.split('\n')[0]}`);
+      }
+    }
 
-    if (info) {
-      missedBlocks = parseInt(info.missed_blocks_counter || 0);
+    if (signingInfo) {
+      missedBlocks = parseInt(signingInfo.missed_blocks_counter || 0);
       console.log(`[FETCHER] Missed blocks: ${missedBlocks}`);
 
       try {
@@ -233,11 +248,10 @@ async function fetchFromLCD() {
         console.warn('[FETCHER] Slashing params fetch failed:', e.message);
       }
     } else {
-      console.warn('[FETCHER] val_signing_info was empty in response');
+      console.warn('[FETCHER] All consensus address candidates returned 404 — signing info unavailable');
     }
   } catch (e) {
     console.warn(`[FETCHER] Signing info fetch failed: ${e.message}`);
-    console.warn(`[FETCHER] Stack: ${e.stack}`);
   }
 
   const stakedUcore    = parseFloat(val.tokens || 0);
