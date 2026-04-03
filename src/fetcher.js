@@ -1,11 +1,9 @@
 // fetcher.js — tries indexer API first (if configured), falls back to LCD
 // Uses multiple LCD endpoints with automatic fallback
-// LCD path derives consensus address and fetches real uptime % + missed blocks + APR + price
 
-const axios          = require('axios');
-const cfg            = require('./config');
-const crypto         = require('crypto');
-const rewardsTracker = require('./rewardsTracker');
+const axios  = require('axios');
+const cfg    = require('./config');
+const crypto = require('crypto');
 
 // ── Bech32 utility (no external deps) ─────────────────────────────────────
 
@@ -61,18 +59,14 @@ function toConsAddress(addrBytes) {
 
 function getCandidateConsAddresses(consensusPubkey) {
   const keyBytes = Buffer.from(consensusPubkey.key, 'base64');
-
-  const hash1 = crypto.createHash('sha256').update(keyBytes).digest();
-  const addr1 = toConsAddress(hash1.slice(0, 20));
-
-  const amino = Buffer.concat([Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]), keyBytes]);
-  const hash2 = crypto.createHash('sha256').update(amino).digest();
-  const addr2 = toConsAddress(hash2.slice(0, 20));
-
-  const hash3a = crypto.createHash('sha256').update(keyBytes).digest();
-  const hash3b = crypto.createHash('ripemd160').update(hash3a).digest();
-  const addr3  = toConsAddress(hash3b);
-
+  const hash1    = crypto.createHash('sha256').update(keyBytes).digest();
+  const addr1    = toConsAddress(hash1.slice(0, 20));
+  const amino    = Buffer.concat([Buffer.from([0x16, 0x24, 0xde, 0x64, 0x20]), keyBytes]);
+  const hash2    = crypto.createHash('sha256').update(amino).digest();
+  const addr2    = toConsAddress(hash2.slice(0, 20));
+  const hash3a   = crypto.createHash('sha256').update(keyBytes).digest();
+  const hash3b   = crypto.createHash('ripemd160').update(hash3a).digest();
+  const addr3    = toConsAddress(hash3b);
   return [addr1, addr2, addr3];
 }
 
@@ -101,7 +95,7 @@ async function lcdGet(path) {
 
 // ── Main entry ─────────────────────────────────────────────────────────────
 
-async function fetchValidatorStats() {
+async function fetchValidatorStats(prevStats) {
   if (cfg.INDEXER_API_URL) {
     try {
       const headers = cfg.INDEXER_API_KEY ? { 'x-api-key': cfg.INDEXER_API_KEY } : {};
@@ -121,7 +115,7 @@ async function fetchValidatorStats() {
     console.log('[FETCHER] No INDEXER_API_URL configured — using LCD');
   }
 
-  return fetchFromLCD();
+  return fetchFromLCD(prevStats);
 }
 
 function normaliseIndexer(d) {
@@ -142,10 +136,11 @@ function normaliseIndexer(d) {
     slashFractionDowntime:   0,
     aprGross:          -1,
     aprDelegator:      -1,
-    aprSource:         'projection',
     inflationRate:     -1,
     txPriceUsd:        -1,
     monthlyRevenueUsd: -1,
+    communityPoolUcore: -1,
+    communityPoolTime:  -1,
   };
 }
 
@@ -167,76 +162,110 @@ async function fetchTxPrice() {
   }
 }
 
-// ── Projection APR (fallback) ─────────────────────────────────────────────
-// Used until rewardsTracker has enough real data points.
+// ── APR calculation ────────────────────────────────────────────────────────
+//
+// Total APR = inflation APR + fee APR
+//
+// Inflation APR:
+//   annual_provisions × (1 - community_tax) / bonded_tokens
+//
+// Fee APR:
+//   The community pool receives community_tax% of all fees.
+//   By tracking the community pool growth between checks we can derive
+//   the total fee flow and back-calculate what stakers earn from fees.
+//
+//   community_pool_delta = pool_now - pool_prev
+//   elapsed_hours        = (time_now - time_prev) / 3_600_000
+//   total_fees_per_hour  = community_pool_delta / community_tax / elapsed_hours
+//   staker_fee_rewards   = total_fees_per_hour × (1 - community_tax) × 8760
+//   fee_apr              = staker_fee_rewards / bonded_tokens × 100
 
-async function fetchProjectionAPR(commissionRate) {
+async function fetchAPRAndInflation(commissionRate, prevStats) {
   try {
-    const [provisionsResp, inflationResp, distResp, poolResp] = await Promise.all([
-      lcdGet('/cosmos/mint/v1beta1/annual_provisions'),
-      lcdGet('/cosmos/mint/v1beta1/inflation'),
-      lcdGet('/cosmos/distribution/v1beta1/params'),
-      lcdGet('/cosmos/staking/v1beta1/pool'),
-    ]);
+    const [provisionsResp, inflationResp, distResp, poolResp, communityPoolResp] =
+      await Promise.all([
+        lcdGet('/cosmos/mint/v1beta1/annual_provisions'),
+        lcdGet('/cosmos/mint/v1beta1/inflation'),
+        lcdGet('/cosmos/distribution/v1beta1/params'),
+        lcdGet('/cosmos/staking/v1beta1/pool'),
+        lcdGet('/cosmos/distribution/v1beta1/community_pool'),
+      ]);
 
-    const annualProvisions = parseFloat(provisionsResp.data?.annual_provisions || 0);
-    const inflationRate    = parseFloat(inflationResp.data?.inflation           || 0);
-    const communityTax     = parseFloat(distResp.data?.params?.community_tax   || 0);
-    const bondedTokens     = parseFloat(poolResp.data?.pool?.bonded_tokens     || 0);
+    const annualProvisions  = parseFloat(provisionsResp.data?.annual_provisions || 0);
+    const inflationRate     = parseFloat(inflationResp.data?.inflation           || 0);
+    const communityTax      = parseFloat(distResp.data?.params?.community_tax   || 0);
+    const bondedTokens      = parseFloat(poolResp.data?.pool?.bonded_tokens     || 0);
+
+    // Community pool current value (ucore)
+    const poolCoins         = communityPoolResp.data?.pool || [];
+    const ucoreEntry        = poolCoins.find(c => c.denom === 'ucore' || c.denom === 'utcore');
+    const communityPoolNow  = ucoreEntry ? parseFloat(ucoreEntry.amount) : -1;
+    const communityPoolTime = Date.now();
 
     if (bondedTokens === 0) throw new Error('bondedTokens is zero');
 
-    const aprGross     = (annualProvisions * (1 - communityTax)) / bondedTokens * 100;
+    // Inflation APR — stable baseline
+    const inflationAPR = (annualProvisions * (1 - communityTax)) / bondedTokens * 100;
+
+    // Fee APR — derived from community pool growth since last check
+    let feeAPR = 0;
+    if (
+      prevStats &&
+      prevStats.communityPoolUcore > 0 &&
+      communityPoolNow > 0 &&
+      prevStats.communityPoolTime > 0 &&
+      communityTax > 0
+    ) {
+      const poolDelta    = communityPoolNow - prevStats.communityPoolUcore;
+      const elapsedMs    = communityPoolTime - prevStats.communityPoolTime;
+      const elapsedHours = elapsedMs / (1000 * 60 * 60);
+
+      if (poolDelta > 0 && elapsedHours > 0.05) {
+        // Back-calculate total fee flow from community pool share
+        const totalFeesPerHour   = poolDelta / communityTax / elapsedHours;
+        const stakerFeePerHour   = totalFeesPerHour * (1 - communityTax);
+        const annualStakerFees   = stakerFeePerHour * 8760;
+        feeAPR = (annualStakerFees / bondedTokens) * 100;
+        console.log(
+          `[FETCHER] Fee APR — pool delta: ${(poolDelta/1e6).toFixed(2)} TX` +
+          ` over ${elapsedHours.toFixed(2)}h` +
+          ` | fee APR: ${feeAPR.toFixed(2)}%`
+        );
+      }
+    }
+
+    const aprGross     = inflationAPR + feeAPR;
     const aprDelegator = aprGross * (1 - commissionRate);
 
     console.log(
-      `[FETCHER] Projection APR — provisions: ${(annualProvisions/1e6).toFixed(0)} TX` +
-      ` | inflation: ${(inflationRate*100).toFixed(4)}%` +
-      ` | gross: ${aprGross.toFixed(2)}%`
+      `[FETCHER] APR — inflation: ${inflationAPR.toFixed(2)}%` +
+      ` | fees: ${feeAPR.toFixed(2)}%` +
+      ` | total gross: ${aprGross.toFixed(2)}%` +
+      ` | delegator: ${aprDelegator.toFixed(2)}%`
     );
 
-    return { aprGross, aprDelegator, inflationRate: inflationRate * 100 };
-  } catch (e) {
-    console.warn('[FETCHER] Projection APR failed:', e.message);
-    return { aprGross: -1, aprDelegator: -1, inflationRate: -1 };
-  }
-}
-
-// ── Fetch cumulative validator rewards for real APR tracking ──────────────
-//
-// /cosmos/distribution/v1beta1/validators/{addr}/outstanding_rewards
-// returns the current undistributed rewards sitting in the validator's pool.
-// This grows monotonically each block, so diffing two readings gives us
-// the actual earn rate over that period.
-
-async function fetchAndRecordRewards(stakedUcore, commissionRate, projectionAPR) {
-  try {
-    const resp = await lcdGet(
-      `/cosmos/distribution/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/outstanding_rewards`
-    );
-    const rewards = resp.data?.rewards?.rewards || [];
-    const ucoreReward = rewards.find(r => r.denom === 'ucore' || r.denom === 'utcore');
-    const amountUcore = ucoreReward ? parseFloat(ucoreReward.amount) : 0;
-
-    // Record this snapshot for rolling APR calculation
-    rewardsTracker.recordSnapshot(amountUcore);
-
-    // Calculate APR from real data (falls back to projection if not enough data yet)
-    return rewardsTracker.calculateAPR(stakedUcore, commissionRate, projectionAPR);
-
-  } catch (e) {
-    console.warn('[FETCHER] Outstanding rewards fetch failed:', e.message);
     return {
-      aprGross:     projectionAPR,
-      aprDelegator: projectionAPR >= 0 ? projectionAPR * (1 - commissionRate) : -1,
-      source:       'projection',
+      aprGross,
+      aprDelegator,
+      inflationRate:      inflationRate * 100,
+      communityPoolUcore: communityPoolNow,
+      communityPoolTime,
+    };
+  } catch (e) {
+    console.warn('[FETCHER] APR calculation failed:', e.message);
+    return {
+      aprGross:           -1,
+      aprDelegator:       -1,
+      inflationRate:      -1,
+      communityPoolUcore: -1,
+      communityPoolTime:  -1,
     };
   }
 }
 
 // ── LCD fetch ──────────────────────────────────────────────────────────────
 
-async function fetchFromLCD() {
+async function fetchFromLCD(prevStats) {
   // 1. Validator details
   const valResp = await lcdGet(
     `/cosmos/staking/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}`
@@ -330,7 +359,7 @@ async function fetchFromLCD() {
 
       if (windowSize > 0 && missedBlocks >= 0) {
         uptimePct = ((windowSize - missedBlocks) / windowSize) * 100;
-        console.log(`[FETCHER] Uptime: ${uptimePct.toFixed(3)}% (window: ${windowSize})`);
+        console.log(`[FETCHER] Uptime: ${uptimePct.toFixed(2)}% (window: ${windowSize})`);
       }
     } catch (e) {
       console.warn('[FETCHER] Slashing params fetch failed:', e.message);
@@ -339,25 +368,17 @@ async function fetchFromLCD() {
     console.warn(`[FETCHER] Signing info fetch failed: ${e.message}`);
   }
 
-  // 5. APR and inflation — run projection and real tracker in sequence
-  //    (projection runs first to provide the fallback value to the tracker)
-  const commissionRate  = parseFloat(val.commission?.commission_rates?.rate || 0.05);
-  const stakedUcore     = parseFloat(val.tokens || 0);
-  const stakedTX        = stakedUcore / cfg.DENOM_DIVISOR;
+  // 5. APR (inflation + fees) and TX price — fetched in parallel
+  const commissionRate = parseFloat(val.commission?.commission_rates?.rate || 0.05);
+  const stakedUcore    = parseFloat(val.tokens || 0);
+  const stakedTX       = stakedUcore / cfg.DENOM_DIVISOR;
 
-  const [projectionResult, txPriceUsd] = await Promise.all([
-    fetchProjectionAPR(commissionRate),
+  const [aprResult, txPriceUsd] = await Promise.all([
+    fetchAPRAndInflation(commissionRate, prevStats),
     fetchTxPrice(),
   ]);
 
-  const { inflationRate } = projectionResult;
-
-  // Real APR from accumulated rewards (uses projection as fallback)
-  const {
-    aprGross,
-    aprDelegator,
-    source: aprSource,
-  } = await fetchAndRecordRewards(stakedUcore, commissionRate, projectionResult.aprGross);
+  const { aprGross, aprDelegator, inflationRate, communityPoolUcore, communityPoolTime } = aprResult;
 
   // Monthly revenue = validator's annual commission earnings / 12 × price
   let monthlyRevenueUsd = -1;
@@ -366,7 +387,7 @@ async function fetchFromLCD() {
     monthlyRevenueUsd     = (annualRevenueTX / 12) * txPriceUsd;
     console.log(
       `[FETCHER] Monthly revenue: $${monthlyRevenueUsd.toFixed(2)}` +
-      ` (${annualRevenueTX.toFixed(0)} TX/yr @ $${txPriceUsd}) [${aprSource}]`
+      ` (${annualRevenueTX.toFixed(0)} TX/yr @ $${txPriceUsd})`
     );
   }
 
@@ -386,10 +407,11 @@ async function fetchFromLCD() {
     slashFractionDowntime,
     aprGross,
     aprDelegator,
-    aprSource,
     inflationRate,
     txPriceUsd,
     monthlyRevenueUsd,
+    communityPoolUcore,
+    communityPoolTime,
   };
 }
 
