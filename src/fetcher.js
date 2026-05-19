@@ -149,10 +149,10 @@ function normaliseIndexer(d) {
 async function fetchTxPrice() {
   try {
     const resp = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price?ids=coreum&vs_currencies=usd',
+      'https://api.coingecko.com/api/v3/simple/price?ids=tx&vs_currencies=usd',
       { timeout: 8000 }
     );
-    const price = resp.data?.coreum?.usd;
+    const price = resp.data?.tx?.usd;
     if (!price) throw new Error('No price returned');
     console.log(`[FETCHER] TX price: $${price}`);
     return price;
