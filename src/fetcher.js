@@ -287,8 +287,8 @@ async function fetchFromLCD(prevStats) {
     console.warn('[FETCHER] Rank fetch failed:', e.message);
   }
 
-  // 3. Delegator count
-  let delegators = 0;
+  // 3. Delegator count (null = could not be read this check)
+  let delegators = null;
   try {
     const delResp = await lcdGet(
       `/cosmos/staking/v1beta1/validators/${cfg.VALIDATOR_ADDRESS}/delegations?pagination.limit=1&pagination.count_total=true`
@@ -317,7 +317,7 @@ async function fetchFromLCD(prevStats) {
     }
   } catch (e) {
     console.warn('[FETCHER] Delegator count failed:', e.message);
-    delegators = 0;
+    delegators = null;
   }
 
   // 4. Missed blocks + uptime + slashing params

@@ -69,6 +69,12 @@ async function check() {
     return;
   }
 
+  // Delegator count couldn't be read — keep the last known value instead of treating it as 0
+  if (stats.delegators === null && lastStats) {
+    console.warn('[CHECK] Delegator count unavailable — keeping last known value');
+    stats.delegators = lastStats.delegators;
+  }
+
   console.log(`[CHECK] Source: ${stats.source}`);
   console.log(`[CHECK] Rank: #${stats.rank} | Staked: ${stats.stakedTX.toFixed(0)} TX | Delegators: ${stats.delegators} | Jailed: ${stats.jailed} | Uptime: ${stats.uptimePct >= 0 ? stats.uptimePct.toFixed(3) + '%' : 'N/A'} | Missed: ${stats.missedBlocks >= 0 ? stats.missedBlocks : 'N/A'}`);
 
@@ -118,7 +124,8 @@ async function check() {
     }
 
     // Delegator count change — alert on any change
-    if (stats.delegators !== lastStats.delegators && lastStats.delegators > 0) {
+    if (stats.delegators !== null && lastStats.delegators !== null
+        && stats.delegators !== lastStats.delegators) {
       console.log(`[ALERT] Delegators: ${lastStats.delegators} → ${stats.delegators}`);
       await alerts.delegatorChangeAlert(stats.delegators, lastStats.delegators);
     }
