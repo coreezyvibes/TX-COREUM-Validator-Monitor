@@ -198,7 +198,8 @@ function votingPowerAlert(current, previous) {
 /** 4-hour digest — always sent with the Coreezy sloth gif */
 function summaryAlert(stats, prev) {
   const stakedDelta = prev ? stats.stakedTX - prev.stakedTX : 0;
-  const delDelta    = prev ? stats.delegators - prev.delegators : 0;
+  const delDelta    = (prev && stats.delegators !== null && prev.delegators !== null)
+    ? stats.delegators - prev.delegators : 0;
   const rankDelta   = prev ? prev.rank - stats.rank : 0;
   const aprDelta    = (prev && prev.aprDelegator >= 0 && stats.aprDelegator >= 0)
     ? stats.aprDelegator - prev.aprDelegator : null;
@@ -237,7 +238,7 @@ function summaryAlert(stats, prev) {
     `${prev && stakedDelta !== 0 ? ` (${stakedDelta > 0 ? '+' : ''}${fmt(stakedDelta)})` : ''}\n\n` +
 
     `<b>Delegators</b>\n` +
-    `${delArrow} ${stats.delegators}` +
+    `${delArrow} ${stats.delegators !== null ? stats.delegators : 'N/A'}` +
     `${prev && delDelta !== 0 ? ` (${delDelta > 0 ? '+' : ''}${delDelta})` : ''}\n\n` +
 
     `<b>Uptime</b>  ${uptimeStr}\n` +
